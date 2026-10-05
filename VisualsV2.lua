@@ -13,7 +13,7 @@ local HttpService = game:GetService("HttpService")
 
 local mainTab = shared.CreateTab(
     "Visuals V2",
-    "/0ludexioso/Visuals-V2/refs/heads/main/icon"
+    "/0ludexioso/VisualsV2/refs/heads/main/icon"
 )
 
 -- Durable plugin settings:
