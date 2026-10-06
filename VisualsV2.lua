@@ -1208,7 +1208,7 @@ local characterOriginal = setmetatable({}, {__mode = "k"})
 
 characterSection:AddParagraph(
     "Character Appearance",
-    "Headless and Korblox are visual-only/client-sided appearance changes. Other players will not see them. Right and Left Korblox are for R15 characters, including R15 avatars using R6-style animations or R6-style body packages."
+    "Headless and Korblox are visual-only/client-sided appearance changes. Other players will not see them. Korblox supports R15 avatars, R15 avatars using R6-style bodies/animations, and forced R6 characters."
 )
 
 local function rememberCharacterObject(obj)
@@ -1270,52 +1270,234 @@ end)
 local korbloxEnabled=C("korbloxEnabled",false)
 local korbloxLeftEnabled=C("korbloxLeftEnabled",false)
 
--- Official Korblox Deathspeaker R15 body-part assets.
--- Right Leg: 139607718
--- Left Leg:  139607673
+-- Official Roblox Korblox Deathspeaker leg assets.
 local KORBLOX_RIGHT_LEG_ASSET=139607718
 local KORBLOX_LEFT_LEG_ASSET=139607673
 
 local korbloxOriginalRightLeg=nil
 local korbloxOriginalLeftLeg=nil
 local korbloxApplying=false
-local korbloxApplyToken=0
+local korbloxGeneration=0
+local korbloxCharacterConnections={}
+local korbloxR6Stored=setmetatable({}, {__mode="k"})
+local korbloxR6Clones=setmetatable({}, {__mode="k"})
+local korbloxTemplateCache={}
 
-local function getR15Humanoid(char)
-    char=char or player.Character
-    local humanoid=char and char:FindFirstChildOfClass("Humanoid")
-    if not humanoid then return nil end
-    if humanoid.RigType~=Enum.HumanoidRigType.R15 then return nil end
-    return humanoid
+local function disconnectKorbloxCharacterConnections()
+    for _,conn in ipairs(korbloxCharacterConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(korbloxCharacterConnections)
 end
 
-local function applyKorbloxDirect(char)
-    char=char or player.Character
-    if korbloxApplying or (not korbloxEnabled and not korbloxLeftEnabled) then return end
+local function officialLegAsset(side)
+    return side=="Left" and KORBLOX_LEFT_LEG_ASSET or KORBLOX_RIGHT_LEG_ASSET
+end
 
-    local humanoid=getR15Humanoid(char)
-    if not humanoid then return end
+local function officialBodyPart(side)
+    return side=="Left" and Enum.BodyPart.LeftLeg or Enum.BodyPart.RightLeg
+end
 
-    korbloxApplying=true
+local function findCharacterMeshFromObject(root,side)
+    if not root then return nil end
+    local wanted=officialBodyPart(side)
+
+    if root:IsA("CharacterMesh") and root.BodyPart==wanted then
+        return root
+    end
+
+    for _,obj in ipairs(root:GetDescendants()) do
+        if obj:IsA("CharacterMesh") and obj.BodyPart==wanted then
+            return obj
+        end
+    end
+
+    -- Some asset loaders return the CharacterMesh without a reliable BodyPart
+    -- until it is parented. Fall back to the first CharacterMesh in that asset.
+    if root:IsA("CharacterMesh") then return root end
+    return root:FindFirstChildWhichIsA("CharacterMesh",true)
+end
+
+local function getOfficialCharacterMeshTemplate(side)
+    if korbloxTemplateCache[side] and korbloxTemplateCache[side].Parent then
+        return korbloxTemplateCache[side]
+    end
+
+    local assetId=officialLegAsset(side)
+    local ok,objects=pcall(function()
+        return game:GetObjects("rbxassetid://"..tostring(assetId))
+    end)
+    if not ok or type(objects)~="table" then return nil end
+
+    local found=nil
+    for _,root in ipairs(objects) do
+        found=findCharacterMeshFromObject(root,side)
+        if found then break end
+    end
+
+    if not found then
+        for _,root in ipairs(objects) do
+            pcall(function() root:Destroy() end)
+        end
+        return nil
+    end
+
+    local template=found:Clone()
+    template.Name="VisualsV2_Korblox_"..side.."_Template"
+
+    for _,root in ipairs(objects) do
+        pcall(function() root:Destroy() end)
+    end
+
+    korbloxTemplateCache[side]=template
+    return template
+end
+
+local function getKorbloxStorage(char)
+    local storage=char:FindFirstChild("VisualsV2_KorbloxStorage")
+    if not storage then
+        storage=Instance.new("Folder")
+        storage.Name="VisualsV2_KorbloxStorage"
+        storage.Parent=char
+    end
+    return storage
+end
+
+local function clearR6Clone(char,side)
+    local name="VisualsV2_Korblox_"..side.."_CharacterMesh"
+    local existing=char and char:FindFirstChild(name)
+    if existing then
+        pcall(function() existing:Destroy() end)
+    end
+end
+
+local function stashConflictingR6Meshes(char,side)
+    local wanted=officialBodyPart(side)
+    local storage=getKorbloxStorage(char)
+
+    for _,obj in ipairs(char:GetChildren()) do
+        if obj:IsA("CharacterMesh")
+            and obj.BodyPart==wanted
+            and not obj.Name:find("VisualsV2_Korblox_",1,true) then
+
+            if not korbloxR6Stored[obj] then
+                korbloxR6Stored[obj]=char
+            end
+            obj.Parent=storage
+        end
+    end
+end
+
+local function applyR6OfficialMesh(char,side)
+    if not char then return false end
+
+    local leg=char:FindFirstChild(side.." Leg")
+    if not leg then return false end
+
+    local template=getOfficialCharacterMeshTemplate(side)
+    if not template then return false end
+
+    stashConflictingR6Meshes(char,side)
+    clearR6Clone(char,side)
+
+    local clone=template:Clone()
+    clone.Name="VisualsV2_Korblox_"..side.."_CharacterMesh"
+    pcall(function() clone.BodyPart=officialBodyPart(side) end)
+    clone.Parent=char
+    korbloxR6Clones[clone]=true
+    return true
+end
+
+local function restoreR6Meshes(char)
+    if not char then return end
+
+    for _,side in ipairs({"Right","Left"}) do
+        clearR6Clone(char,side)
+    end
+
+    local storage=char:FindFirstChild("VisualsV2_KorbloxStorage")
+    if storage then
+        for _,obj in ipairs(storage:GetChildren()) do
+            if obj:IsA("CharacterMesh") then
+                obj.Parent=char
+            end
+        end
+        pcall(function() storage:Destroy() end)
+    end
+end
+
+local function characterUsesR15Parts(char)
+    return char
+        and (char:FindFirstChild("RightUpperLeg")
+        or char:FindFirstChild("LeftUpperLeg"))~=nil
+end
+
+local function characterUsesR6Parts(char)
+    return char
+        and (char:FindFirstChild("Right Leg")
+        or char:FindFirstChild("Left Leg"))~=nil
+end
+
+local function applyR15Description(char)
+    local humanoid=char and char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return false end
 
     local okDesc,desc=pcall(function()
         return humanoid:GetAppliedDescription()
     end)
+    if not okDesc or not desc then return false end
 
-    if okDesc and desc then
-        if korbloxOriginalRightLeg==nil then
-            korbloxOriginalRightLeg=desc.RightLeg
-        end
-        if korbloxOriginalLeftLeg==nil then
-            korbloxOriginalLeftLeg=desc.LeftLeg
-        end
+    if korbloxOriginalRightLeg==nil then
+        korbloxOriginalRightLeg=desc.RightLeg
+    end
+    if korbloxOriginalLeftLeg==nil then
+        korbloxOriginalLeftLeg=desc.LeftLeg
+    end
 
-        desc.RightLeg=korbloxEnabled and KORBLOX_RIGHT_LEG_ASSET or korbloxOriginalRightLeg
-        desc.LeftLeg=korbloxLeftEnabled and KORBLOX_LEFT_LEG_ASSET or korbloxOriginalLeftLeg
+    desc.RightLeg=korbloxEnabled and KORBLOX_RIGHT_LEG_ASSET or korbloxOriginalRightLeg
+    desc.LeftLeg=korbloxLeftEnabled and KORBLOX_LEFT_LEG_ASSET or korbloxOriginalLeftLeg
 
+    local okApply=pcall(function()
+        humanoid:ApplyDescription(desc)
+    end)
+
+    if not okApply then
         pcall(function()
-            humanoid:ApplyDescription(desc)
+            humanoid:ApplyDescriptionReset(desc)
+            okApply=true
         end)
+    end
+
+    return okApply
+end
+
+local function applyKorbloxNow(char)
+    char=char or player.Character
+    if korbloxApplying
+        or not char
+        or (not korbloxEnabled and not korbloxLeftEnabled) then
+        return
+    end
+
+    korbloxApplying=true
+
+    -- Detect the actual character structure rather than trusting RigType alone.
+    -- This covers R15 avatars using R6-styled UGC bodies/animations and games
+    -- that force a classic R6 character.
+    if characterUsesR15Parts(char) then
+        applyR15Description(char)
+    elseif characterUsesR6Parts(char) then
+        if korbloxEnabled then
+            applyR6OfficialMesh(char,"Right")
+        else
+            clearR6Clone(char,"Right")
+        end
+
+        if korbloxLeftEnabled then
+            applyR6OfficialMesh(char,"Left")
+        else
+            clearR6Clone(char,"Left")
+        end
     end
 
     korbloxApplying=false
@@ -1328,15 +1510,19 @@ local function applyKorbloxDirect(char)
 end
 
 local function restoreKorblox()
-    korbloxApplyToken+=1
+    korbloxGeneration+=1
+    disconnectKorbloxCharacterConnections()
 
     local char=player.Character
-    local humanoid=getR15Humanoid(char)
+    if char then
+        restoreR6Meshes(char)
+    end
+
+    local humanoid=char and char:FindFirstChildOfClass("Humanoid")
     if humanoid and (korbloxOriginalRightLeg~=nil or korbloxOriginalLeftLeg~=nil) then
         local okDesc,desc=pcall(function()
             return humanoid:GetAppliedDescription()
         end)
-
         if okDesc and desc then
             if korbloxOriginalRightLeg~=nil then
                 desc.RightLeg=korbloxOriginalRightLeg
@@ -1344,10 +1530,7 @@ local function restoreKorblox()
             if korbloxOriginalLeftLeg~=nil then
                 desc.LeftLeg=korbloxOriginalLeftLeg
             end
-
-            pcall(function()
-                humanoid:ApplyDescription(desc)
-            end)
+            pcall(function() humanoid:ApplyDescription(desc) end)
         end
     end
 
@@ -1355,39 +1538,60 @@ local function restoreKorblox()
     korbloxOriginalLeftLeg=nil
 
     task.defer(function()
-        if headlessEnabled then
-            applyCharacterVisuals()
-        end
+        if headlessEnabled then applyCharacterVisuals() end
     end)
 end
 
 local function scheduleKorbloxReapply(char)
     if not char or (not korbloxEnabled and not korbloxLeftEnabled) then return end
 
-    korbloxApplyToken+=1
-    local token=korbloxApplyToken
+    korbloxGeneration+=1
+    local generation=korbloxGeneration
+    disconnectKorbloxCharacterConnections()
 
+    -- Reapply through the whole spawn/appearance window. This is deliberately
+    -- longer than before because MM2/UGC body loaders can replace body parts
+    -- well after CharacterAdded.
     task.spawn(function()
-        local humanoid=char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid",2)
-        if not humanoid or humanoid.RigType~=Enum.HumanoidRigType.R15 then
-            pcall(function() shared.Notify("Korblox requires an R15 character",2) end)
-            return
-        end
+        char:WaitForChild("Humanoid",3)
 
-        char:WaitForChild("RightUpperLeg",2)
-        char:WaitForChild("LeftUpperLeg",2)
-
-        for _,delayTime in ipairs({0,0.10,0.30,0.65}) do
+        for _,delayTime in ipairs({0,0.05,0.15,0.35,0.75,1.50,3.00}) do
             task.delay(delayTime,function()
-                if token~=korbloxApplyToken
+                if generation~=korbloxGeneration
                     or player.Character~=char
                     or (not korbloxEnabled and not korbloxLeftEnabled) then
                     return
                 end
-                applyKorbloxDirect(char)
+                applyKorbloxNow(char)
             end)
         end
     end)
+
+    -- If the game/UGC system rebuilds a limb or classic CharacterMesh after the
+    -- scheduled passes, queue one more guarded reapplication.
+    local pending=false
+    table.insert(korbloxCharacterConnections,char.ChildAdded:Connect(function(obj)
+        if not (korbloxEnabled or korbloxLeftEnabled) then return end
+
+        local relevant=
+            obj.Name=="RightUpperLeg"
+            or obj.Name=="LeftUpperLeg"
+            or obj.Name=="Right Leg"
+            or obj.Name=="Left Leg"
+            or obj:IsA("CharacterMesh")
+
+        if relevant and not pending then
+            pending=true
+            task.delay(0.12,function()
+                pending=false
+                if generation==korbloxGeneration
+                    and player.Character==char
+                    and (korbloxEnabled or korbloxLeftEnabled) then
+                    applyKorbloxNow(char)
+                end
+            end)
+        end
+    end))
 end
 
 local function refreshKorblox()
@@ -1400,7 +1604,7 @@ end
 
 local korbloxToggle=addToggle(
     characterSection,
-    "Korblox Right Leg [R15 Only]",
+    "Korblox Right Leg",
     korbloxEnabled,
     function(state)
         korbloxEnabled=state
@@ -1411,13 +1615,18 @@ local korbloxToggle=addToggle(
 
 local korbloxLeftToggle=addToggle(
     characterSection,
-    "Korblox Left Leg [R15 Only]",
+    "Korblox Left Leg",
     korbloxLeftEnabled,
     function(state)
         korbloxLeftEnabled=state
         SetCfg("korbloxLeftEnabled",state)
         refreshKorblox()
     end
+)
+
+characterSection:AddParagraph(
+    "Korblox",
+    "Uses the original Roblox Korblox leg assets and reapplies them automatically after respawning or avatar body changes."
 )
 
 pcall(function()
@@ -1430,52 +1639,17 @@ end)
 
 characterSection:AddParagraph(
     "No interruption on emoting",
-    "Makes (Roblox) emotes uninterrupted by any other player (doesn't always work)"
+    "Prevents other players from colliding with you while a Roblox emote is playing."
 )
+
 local noInterruptionEmote=C("noInterruptionEmote",false)
 local emoteConnections={}
-local emotePartStates=setmetatable({}, {__mode="k"})
 local normalEmoteIds={}
 local guardedTracks=setmetatable({}, {__mode="k"})
 local suppressedTracks=setmetatable({}, {__mode="k"})
-local emoteHeartbeat=nil
+local antiFlingConnection=nil
 local emoteScanToken=0
-
-local function disconnectEmoteConnections()
-    emoteScanToken+=1
-    for _,conn in ipairs(emoteConnections) do
-        pcall(function() conn:Disconnect() end)
-    end
-    table.clear(emoteConnections)
-
-    if emoteHeartbeat then
-        pcall(function() emoteHeartbeat:Disconnect() end)
-        emoteHeartbeat=nil
-    end
-end
-
-local function restoreEmoteCollision()
-    for part,oldCanCollide in pairs(emotePartStates) do
-        if part and part.Parent and part:IsA("BasePart") then
-            pcall(function()
-                part.CanCollide=oldCanCollide
-            end)
-        end
-    end
-    emotePartStates=setmetatable({}, {__mode="k"})
-end
-
-local function setCharacterNoCollision(char)
-    if not char then return end
-    for _,obj in ipairs(char:GetDescendants()) do
-        if obj:IsA("BasePart") then
-            if emotePartStates[obj]==nil then
-                emotePartStates[obj]=obj.CanCollide
-            end
-            obj.CanCollide=false
-        end
-    end
-end
+local remoteCollisionOriginals=setmetatable({}, {__mode="k"})
 
 local function animationNumericId(animationId)
     if type(animationId)~="string" then return nil end
@@ -1490,7 +1664,6 @@ end
 local function cacheNormalRobloxEmotes(char,humanoid)
     normalEmoteIds={}
 
-    -- Equipped Roblox avatar emotes.
     local ok,description=pcall(function()
         return humanoid:GetAppliedDescription()
     end)
@@ -1509,32 +1682,21 @@ local function cacheNormalRobloxEmotes(char,humanoid)
         end
     end
 
-    -- Classic/default Roblox emotes stored by the character Animate script.
-    -- Only emote-named animation objects are included; unrelated MM2 action
-    -- animations are deliberately ignored.
     local animate=char and char:FindFirstChild("Animate")
     if animate then
         local normalNames={
             wave=true,point=true,dance=true,dance2=true,dance3=true,
             laugh=true,cheer=true,sit=true
         }
-
         for _,obj in ipairs(animate:GetDescendants()) do
             if obj:IsA("Animation") then
-                local lowerName=tostring(obj.Name or ""):lower()
-                local parentName=obj.Parent and tostring(obj.Parent.Name or ""):lower() or ""
-                local qualifies=false
-
+                local lower=tostring(obj.Name or ""):lower()
+                local parent=obj.Parent and tostring(obj.Parent.Name or ""):lower() or ""
                 for emoteName in pairs(normalNames) do
-                    if lowerName:find(emoteName,1,true)
-                        or parentName:find(emoteName,1,true) then
-                        qualifies=true
+                    if lower:find(emoteName,1,true) or parent:find(emoteName,1,true) then
+                        addNormalEmoteId(animationNumericId(obj.AnimationId))
                         break
                     end
-                end
-
-                if qualifies then
-                    addNormalEmoteId(animationNumericId(obj.AnimationId))
                 end
             end
         end
@@ -1547,7 +1709,24 @@ local function isNormalRobloxEmote(track)
     return id~=nil and normalEmoteIds[id]==true
 end
 
-local function anyGuardedTrackPlaying()
+local function restoreRemoteCollisions()
+    for part,oldValue in pairs(remoteCollisionOriginals) do
+        if part and part.Parent and part:IsA("BasePart") then
+            pcall(function() part.CanCollide=oldValue end)
+        end
+    end
+    remoteCollisionOriginals=setmetatable({}, {__mode="k"})
+end
+
+local function stopEmoteAntiCollision()
+    if antiFlingConnection then
+        pcall(function() antiFlingConnection:Disconnect() end)
+        antiFlingConnection=nil
+    end
+    restoreRemoteCollisions()
+end
+
+local function anyActiveNormalEmote()
     for track in pairs(guardedTracks) do
         if track and track.IsPlaying and not suppressedTracks[track] then
             return true
@@ -1556,27 +1735,31 @@ local function anyGuardedTrackPlaying()
     return false
 end
 
-local function releaseEmoteProtection()
-    restoreEmoteCollision()
-end
-
-local function suppressCurrentTracks()
-    for track in pairs(guardedTracks) do
-        if track and track.IsPlaying then
-            suppressedTracks[track]=true
+local function applyRemoteNoCollision()
+    -- Adapted from ATAOs "Enable IY Anti Fling": only other players are made
+    -- non-collidable, and only while the local player is actively emoting.
+    for _,otherPlayer in ipairs(Players:GetPlayers()) do
+        if otherPlayer~=player and otherPlayer.Character then
+            for _,part in ipairs(otherPlayer.Character:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    if remoteCollisionOriginals[part]==nil then
+                        remoteCollisionOriginals[part]=part.CanCollide
+                    end
+                    part.CanCollide=false
+                end
+            end
         end
     end
-    releaseEmoteProtection()
 end
 
-local function ensureEmoteHeartbeat(humanoid,char)
-    if emoteHeartbeat then return end
+local function startEmoteAntiCollision(humanoid,char)
+    if antiFlingConnection then return end
 
-    emoteHeartbeat=RunService.Heartbeat:Connect(function()
+    antiFlingConnection=RunService.Stepped:Connect(function()
         if not noInterruptionEmote
             or player.Character~=char
             or not humanoid.Parent then
-            releaseEmoteProtection()
+            stopEmoteAntiCollision()
             return
         end
 
@@ -1584,70 +1767,74 @@ local function ensureEmoteHeartbeat(humanoid,char)
         local moving=humanoid.MoveDirection.Magnitude>0.05
         local jumping=humanoid.Jump
             or state==Enum.HumanoidStateType.Jumping
+            or state==Enum.HumanoidStateType.Freefall
 
         if moving or jumping then
-            suppressCurrentTracks()
+            -- Movement/jumping intentionally cancels protection for the current
+            -- emote, even if its animation track takes a moment to stop.
+            for track in pairs(guardedTracks) do
+                if track and track.IsPlaying then
+                    suppressedTracks[track]=true
+                end
+            end
+            stopEmoteAntiCollision()
             return
         end
 
-        if anyGuardedTrackPlaying() then
-            -- Noclip only. Do not freeze velocity, change Massless/CanTouch,
-            -- or manipulate the animation track itself.
-            setCharacterNoCollision(char)
+        if anyActiveNormalEmote() then
+            applyRemoteNoCollision()
         else
-            releaseEmoteProtection()
+            stopEmoteAntiCollision()
         end
     end)
 end
 
 local function watchNormalEmoteTrack(track,humanoid,char)
-    if not noInterruptionEmote then return end
-    if not isNormalRobloxEmote(track) then return end
-    if guardedTracks[track] then return end
+    if not noInterruptionEmote
+        or guardedTracks[track]
+        or not isNormalRobloxEmote(track) then
+        return
+    end
 
     guardedTracks[track]=true
     suppressedTracks[track]=nil
-
-    local state=humanoid:GetState()
-    if humanoid.MoveDirection.Magnitude<=0.05
-        and not humanoid.Jump
-        and state~=Enum.HumanoidStateType.Jumping then
-        setCharacterNoCollision(char)
-    end
+    startEmoteAntiCollision(humanoid,char)
 
     local stopped
     stopped=track.Stopped:Connect(function()
         if stopped then stopped:Disconnect() end
         guardedTracks[track]=nil
         suppressedTracks[track]=nil
-
-        -- Never replay or restart an emote. Once Roblox/MM2 stops the track,
-        -- the protection simply ends.
-        if not anyGuardedTrackPlaying() then
-            releaseEmoteProtection()
+        if not anyActiveNormalEmote() then
+            stopEmoteAntiCollision()
         end
     end)
     table.insert(emoteConnections,stopped)
 end
 
+local function disconnectEmoteConnections()
+    emoteScanToken+=1
+    for _,conn in ipairs(emoteConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(emoteConnections)
+    stopEmoteAntiCollision()
+end
+
 local function setupAutomaticEmoteProtection(char)
     disconnectEmoteConnections()
-    releaseEmoteProtection()
     table.clear(guardedTracks)
     table.clear(suppressedTracks)
 
     if not noInterruptionEmote or not char then return end
 
-    local humanoid=char:FindFirstChildOfClass("Humanoid")
-        or char:WaitForChild("Humanoid",5)
+    local humanoid=char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid",5)
     if not humanoid then return end
 
-    local animator=humanoid:FindFirstChildOfClass("Animator")
-        or humanoid:WaitForChild("Animator",5)
+    local animator=humanoid:FindFirstChildOfClass("Animator") or humanoid:WaitForChild("Animator",5)
     if not animator then return end
 
     cacheNormalRobloxEmotes(char,humanoid)
-    ensureEmoteHeartbeat(humanoid,char)
 
     table.insert(emoteConnections,animator.AnimationPlayed:Connect(function(track)
         watchNormalEmoteTrack(track,humanoid,char)
@@ -1657,7 +1844,6 @@ local function setupAutomaticEmoteProtection(char)
         watchNormalEmoteTrack(track,humanoid,char)
     end
 
-    -- Light rescan for executors/games that occasionally miss AnimationPlayed.
     emoteScanToken+=1
     local token=emoteScanToken
     task.spawn(function()
@@ -1665,6 +1851,7 @@ local function setupAutomaticEmoteProtection(char)
             and token==emoteScanToken
             and player.Character==char
             and char.Parent do
+
             for _,track in ipairs(animator:GetPlayingAnimationTracks()) do
                 watchNormalEmoteTrack(track,humanoid,char)
             end
@@ -1685,7 +1872,6 @@ local noInterruptionToggle=addToggle(
             setupAutomaticEmoteProtection(player.Character)
         else
             disconnectEmoteConnections()
-            releaseEmoteProtection()
             table.clear(guardedTracks)
             table.clear(suppressedTracks)
         end
@@ -1711,7 +1897,6 @@ env.VisualsV2Runtime.RegisterReset(function()
     noInterruptionToggle:Set(false)
     noInterruptionEmote=false
     disconnectEmoteConnections()
-    releaseEmoteProtection()
     table.clear(guardedTracks)
     table.clear(suppressedTracks)
 end)
