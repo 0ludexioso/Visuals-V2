@@ -1276,13 +1276,14 @@ local KorbloxSystem={
 
 ;(function()
 -- =========================================================
--- KORBLOX: DIRECT R15 MESH REPLACEMENT
--- Both sides operate independently on the existing R15 body parts.
+-- KORBLOX: DIRECT R15 MESH REPLACEMENT + SOURCE-RIG FITTING
+-- Left/right remain independent. No ApplyDescription loops.
 -- =========================================================
 
+local RIGHT_ASSET_ID=139607718
+local LEFT_ASSET_ID=139607673
 local RIGHT_UPPER_MESH="rbxassetid://9598310133"
 local RIGHT_TEXTURE="rbxassetid://902843398"
-
 local LEFT_UPPER_MESH="rbxassetid://9598310131"
 local LEFT_LOWER_MESH="rbxassetid://9598310137"
 local LEFT_FOOT_MESH="rbxassetid://9598310118"
@@ -1292,42 +1293,117 @@ local rightCharacter=nil
 local leftCharacter=nil
 local rightGeneration=0
 local leftGeneration=0
-
 local rightPartOriginals=setmetatable({}, {__mode="k"})
 local leftPartOriginals=setmetatable({}, {__mode="k"})
+local rightWatchers={}
+local leftWatchers={}
+local sourceCache={}
+
+local function disconnectList(list)
+    for _,c in ipairs(list) do pcall(function() c:Disconnect() end) end
+    table.clear(list)
+end
 
 local function rememberPart(store,part)
     if not part or not part:IsA("BasePart") or store[part] then return end
-    store[part]={
+    local data={
         Transparency=part.Transparency,
         LocalTransparencyModifier=part.LocalTransparencyModifier,
+        Size=part.Size,
         MeshId=part:IsA("MeshPart") and part.MeshId or nil,
         TextureID=part:IsA("MeshPart") and part.TextureID or nil,
+        Attachments={},
     }
+    for _,child in ipairs(part:GetChildren()) do
+        if child:IsA("Attachment") then data.Attachments[child.Name]=child.CFrame end
+    end
+    store[part]=data
+end
+
+local function rememberMotor(store,motor)
+    if not motor or not motor:IsA("Motor6D") or store[motor] then return end
+    store[motor]={Motor=true,C0=motor.C0,C1=motor.C1}
 end
 
 local function restoreParts(store)
-    for part,data in pairs(store) do
-        if part and part.Parent then
-            pcall(function() part.Transparency=data.Transparency end)
-            pcall(function() part.LocalTransparencyModifier=data.LocalTransparencyModifier end)
-            if part:IsA("MeshPart") then
-                if data.MeshId~=nil then pcall(function() part.MeshId=data.MeshId end) end
-                if data.TextureID~=nil then pcall(function() part.TextureID=data.TextureID end) end
+    for obj,data in pairs(store) do
+        if obj and obj.Parent then
+            if data.Motor and obj:IsA("Motor6D") then
+                pcall(function() obj.C0=data.C0; obj.C1=data.C1 end)
+            elseif obj:IsA("BasePart") then
+                pcall(function() obj.Transparency=data.Transparency end)
+                pcall(function() obj.LocalTransparencyModifier=data.LocalTransparencyModifier end)
+                pcall(function() obj.Size=data.Size end)
+                if obj:IsA("MeshPart") then
+                    if data.MeshId~=nil then pcall(function() obj.MeshId=data.MeshId end) end
+                    if data.TextureID~=nil then pcall(function() obj.TextureID=data.TextureID end) end
+                end
+                for name,cf in pairs(data.Attachments or {}) do
+                    local a=obj:FindFirstChild(name)
+                    if a and a:IsA("Attachment") then pcall(function() a.CFrame=cf end) end
+                end
             end
         end
     end
 end
 
+local function normalizeAssetId(id)
+    return tostring(id or ""):match("(%d+)") or ""
+end
+
+local function loadSourceRig(assetId,expected)
+    if sourceCache[assetId]~=nil then return sourceCache[assetId] or nil end
+    sourceCache[assetId]=false
+    local ok,objects=pcall(function() return game:GetObjects("rbxassetid://"..tostring(assetId)) end)
+    if not ok or type(objects)~="table" then return nil end
+    local found={}
+    for _,root in ipairs(objects) do
+        local pool={root}
+        for _,d in ipairs(root:GetDescendants()) do table.insert(pool,d) end
+        for _,obj in ipairs(pool) do
+            if obj:IsA("MeshPart") then
+                local mesh=normalizeAssetId(obj.MeshId)
+                for key,wanted in pairs(expected) do
+                    if mesh==normalizeAssetId(wanted) then found[key]=obj:Clone() end
+                end
+            end
+        end
+        pcall(function() root:Destroy() end)
+    end
+    if next(found) then sourceCache[assetId]=found return found end
+    return nil
+end
+
+local function copyRigGeometry(target,source)
+    if not target or not source or not target:IsA("MeshPart") or not source:IsA("MeshPart") then return end
+    pcall(function() target.Size=source.Size end)
+    for _,a in ipairs(source:GetChildren()) do
+        if a:IsA("Attachment") then
+            local targetA=target:FindFirstChild(a.Name)
+            if targetA and targetA:IsA("Attachment") then pcall(function() targetA.CFrame=a.CFrame end) end
+        end
+    end
+end
+
+local function syncJointFromAttachments(motor,part0Name,part1Name)
+    if not motor or not motor:IsA("Motor6D") or not motor.Part0 or not motor.Part1 then return end
+    local a0=motor.Part0:FindFirstChild(part0Name)
+    local a1=motor.Part1:FindFirstChild(part1Name)
+    if a0 and a0:IsA("Attachment") and a1 and a1:IsA("Attachment") then
+        pcall(function() motor.C0=a0.CFrame; motor.C1=a1.CFrame end)
+    end
+end
+
 local function clearRightCaptureForNewCharacter(char)
     if rightCharacter~=char then
+        disconnectList(rightWatchers)
         rightCharacter=char
         rightPartOriginals=setmetatable({}, {__mode="k"})
     end
 end
-
 local function clearLeftCaptureForNewCharacter(char)
     if leftCharacter~=char then
+        disconnectList(leftWatchers)
         leftCharacter=char
         leftPartOriginals=setmetatable({}, {__mode="k"})
     end
@@ -1335,14 +1411,12 @@ end
 
 local function getR15Parts(char,side)
     if not char then return nil,nil,nil,nil end
-    local humanoid=char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid",2)
-    if not humanoid or humanoid.RigType~=Enum.HumanoidRigType.R15 then
-        return nil,nil,nil,humanoid
-    end
-
-    local upper=char:FindFirstChild(side.."UpperLeg") or char:WaitForChild(side.."UpperLeg",2)
-    local lower=char:FindFirstChild(side.."LowerLeg") or char:WaitForChild(side.."LowerLeg",2)
-    local foot=char:FindFirstChild(side.."Foot") or char:WaitForChild(side.."Foot",2)
+    local humanoid=char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid",3)
+    -- Some R6-styled packages still expose the R15 limb structure. Prefer the
+    -- actual limb objects over appearance/animation style when deciding support.
+    local upper=char:FindFirstChild(side.."UpperLeg") or char:WaitForChild(side.."UpperLeg",3)
+    local lower=char:FindFirstChild(side.."LowerLeg") or char:WaitForChild(side.."LowerLeg",3)
+    local foot=char:FindFirstChild(side.."Foot") or char:WaitForChild(side.."Foot",3)
     return upper,lower,foot,humanoid
 end
 
@@ -1350,28 +1424,13 @@ local function applyRight(char)
     if not KorbloxSystem.RightEnabled then return false end
     char=char or player.Character
     if not char or player.Character~=char then return false end
-
     local upper,lower,foot,humanoid=getR15Parts(char,"Right")
-    if not humanoid or humanoid.RigType~=Enum.HumanoidRigType.R15 then
-        pcall(function() shared.Notify("Korblox requires R15",2) end)
-        return false
-    end
-    if not upper or not lower or not foot or not upper:IsA("MeshPart") then return false end
-
+    if not humanoid or not upper or not lower or not foot or not upper:IsA("MeshPart") then return false end
     clearRightCaptureForNewCharacter(char)
-    rememberPart(rightPartOriginals,upper)
-    rememberPart(rightPartOriginals,lower)
-    rememberPart(rightPartOriginals,foot)
-
-    pcall(function() upper.MeshId=RIGHT_UPPER_MESH end)
-    pcall(function() upper.TextureID=RIGHT_TEXTURE end)
-    pcall(function() upper.Transparency=0 end)
-    pcall(function() upper.LocalTransparencyModifier=0 end)
-
-    pcall(function() lower.Transparency=1 end)
-    pcall(function() lower.LocalTransparencyModifier=1 end)
-    pcall(function() foot.Transparency=1 end)
-    pcall(function() foot.LocalTransparencyModifier=1 end)
+    rememberPart(rightPartOriginals,upper); rememberPart(rightPartOriginals,lower); rememberPart(rightPartOriginals,foot)
+    pcall(function() upper.MeshId=RIGHT_UPPER_MESH; upper.TextureID=RIGHT_TEXTURE; upper.Transparency=0; upper.LocalTransparencyModifier=0 end)
+    pcall(function() lower.Transparency=1; lower.LocalTransparencyModifier=1 end)
+    pcall(function() foot.Transparency=1; foot.LocalTransparencyModifier=1 end)
     return true
 end
 
@@ -1379,129 +1438,140 @@ local function applyLeft(char)
     if not KorbloxSystem.LeftEnabled then return false end
     char=char or player.Character
     if not char or player.Character~=char then return false end
-
     local upper,lower,foot,humanoid=getR15Parts(char,"Left")
-    if not humanoid or humanoid.RigType~=Enum.HumanoidRigType.R15 then
-        pcall(function() shared.Notify("Korblox requires R15",2) end)
-        return false
-    end
-    if not upper or not lower or not foot
-        or not upper:IsA("MeshPart")
-        or not lower:IsA("MeshPart")
-        or not foot:IsA("MeshPart") then
-        return false
-    end
-
+    if not humanoid or not upper or not lower or not foot or not upper:IsA("MeshPart") or not lower:IsA("MeshPart") or not foot:IsA("MeshPart") then return false end
     clearLeftCaptureForNewCharacter(char)
-    rememberPart(leftPartOriginals,upper)
-    rememberPart(leftPartOriginals,lower)
-    rememberPart(leftPartOriginals,foot)
+    rememberPart(leftPartOriginals,upper); rememberPart(leftPartOriginals,lower); rememberPart(leftPartOriginals,foot)
 
-    pcall(function() upper.MeshId=LEFT_UPPER_MESH end)
-    pcall(function() upper.TextureID=LEFT_TEXTURE end)
-    pcall(function() upper.Transparency=0 end)
-    pcall(function() upper.LocalTransparencyModifier=0 end)
+    local hip=(char:FindFirstChild("LowerTorso") and char.LowerTorso:FindFirstChild("LeftHip")) or upper:FindFirstChild("LeftHip")
+    local knee=upper:FindFirstChild("LeftKnee")
+    local ankle=lower:FindFirstChild("LeftAnkle")
+    rememberMotor(leftPartOriginals,hip); rememberMotor(leftPartOriginals,knee); rememberMotor(leftPartOriginals,ankle)
 
-    pcall(function() lower.MeshId=LEFT_LOWER_MESH end)
-    pcall(function() lower.TextureID=LEFT_TEXTURE end)
-    pcall(function() lower.Transparency=0 end)
-    pcall(function() lower.LocalTransparencyModifier=0 end)
+    pcall(function() upper.MeshId=LEFT_UPPER_MESH; upper.TextureID=LEFT_TEXTURE; upper.Transparency=0; upper.LocalTransparencyModifier=0 end)
+    pcall(function() lower.MeshId=LEFT_LOWER_MESH; lower.TextureID=LEFT_TEXTURE; lower.Transparency=0; lower.LocalTransparencyModifier=0 end)
+    pcall(function() foot.MeshId=LEFT_FOOT_MESH; foot.Transparency=1; foot.LocalTransparencyModifier=1 end)
 
-    pcall(function() foot.MeshId=LEFT_FOOT_MESH end)
-    pcall(function() foot.Transparency=1 end)
-    pcall(function() foot.LocalTransparencyModifier=1 end)
+    -- Pull exact Size/rig-attachment geometry from Roblox's left-leg body-part
+    -- asset when the executor permits game:GetObjects. If unavailable, the mesh
+    -- replacement above remains the safe fallback rather than guessing dimensions.
+    local source=loadSourceRig(LEFT_ASSET_ID,{upper=LEFT_UPPER_MESH,lower=LEFT_LOWER_MESH,foot=LEFT_FOOT_MESH})
+    if source then
+        copyRigGeometry(upper,source.upper)
+        copyRigGeometry(lower,source.lower)
+        copyRigGeometry(foot,source.foot)
+        syncJointFromAttachments(hip,"LeftHipRigAttachment","LeftHipRigAttachment")
+        syncJointFromAttachments(knee,"LeftKneeRigAttachment","LeftKneeRigAttachment")
+        syncJointFromAttachments(ankle,"LeftAnkleRigAttachment","LeftAnkleRigAttachment")
+    end
     return true
 end
 
 local function removeRight()
-    rightGeneration+=1
+    rightGeneration+=1; disconnectList(rightWatchers)
     restoreParts(rightPartOriginals)
-    rightPartOriginals=setmetatable({}, {__mode="k"})
-    rightCharacter=nil
+    rightPartOriginals=setmetatable({}, {__mode="k"}); rightCharacter=nil
+end
+local function removeLeft()
+    leftGeneration+=1; disconnectList(leftWatchers)
+    restoreParts(leftPartOriginals)
+    leftPartOriginals=setmetatable({}, {__mode="k"}); leftCharacter=nil
 end
 
-local function removeLeft()
-    leftGeneration+=1
-    restoreParts(leftPartOriginals)
-    leftPartOriginals=setmetatable({}, {__mode="k"})
-    leftCharacter=nil
+local function rightIsCorrect(char)
+    local u,l,f=getR15Parts(char,"Right")
+    return u and l and f and u:IsA("MeshPart") and normalizeAssetId(u.MeshId)==normalizeAssetId(RIGHT_UPPER_MESH)
+        and normalizeAssetId(u.TextureID)==normalizeAssetId(RIGHT_TEXTURE) and l.Transparency>=0.99 and f.Transparency>=0.99
+end
+local function leftIsCorrect(char)
+    local u,l,f=getR15Parts(char,"Left")
+    return u and l and f and u:IsA("MeshPart") and l:IsA("MeshPart")
+        and normalizeAssetId(u.MeshId)==normalizeAssetId(LEFT_UPPER_MESH)
+        and normalizeAssetId(l.MeshId)==normalizeAssetId(LEFT_LOWER_MESH)
+        and normalizeAssetId(u.TextureID)==normalizeAssetId(LEFT_TEXTURE)
+        and normalizeAssetId(l.TextureID)==normalizeAssetId(LEFT_TEXTURE) and f.Transparency>=0.99
+end
+
+local function installRightWatchers(char,generation)
+    disconnectList(rightWatchers)
+    local u,l,f=getR15Parts(char,"Right")
+    local busy=false
+    local function repair()
+        if busy or generation~=rightGeneration or player.Character~=char or not KorbloxSystem.RightEnabled then return end
+        if rightIsCorrect(char) then return end
+        busy=true; task.defer(function() applyRight(char); busy=false end)
+    end
+    for _,p in ipairs({u,l,f}) do
+        if p then table.insert(rightWatchers,p.Changed:Connect(function(prop)
+            if prop=="MeshId" or prop=="TextureID" or prop=="Transparency" then repair() end
+        end)) end
+    end
+end
+local function installLeftWatchers(char,generation)
+    disconnectList(leftWatchers)
+    local u,l,f=getR15Parts(char,"Left")
+    local busy=false
+    local function repair()
+        if busy or generation~=leftGeneration or player.Character~=char or not KorbloxSystem.LeftEnabled then return end
+        if leftIsCorrect(char) then return end
+        busy=true; task.defer(function() applyLeft(char); busy=false end)
+    end
+    for _,p in ipairs({u,l,f}) do
+        if p then table.insert(leftWatchers,p.Changed:Connect(function(prop)
+            if prop=="MeshId" or prop=="TextureID" or prop=="Transparency" then repair() end
+        end)) end
+    end
 end
 
 local function scheduleRight(char)
     if not char or not KorbloxSystem.RightEnabled then return end
-    rightGeneration+=1
-    local generation=rightGeneration
+    rightGeneration+=1; local generation=rightGeneration
     clearRightCaptureForNewCharacter(char)
-
-    task.defer(function()
+    task.spawn(function()
+        char:WaitForChild("Humanoid",3); char:WaitForChild("RightUpperLeg",3); char:WaitForChild("RightLowerLeg",3); char:WaitForChild("RightFoot",3)
         if generation~=rightGeneration or player.Character~=char or not KorbloxSystem.RightEnabled then return end
         applyRight(char)
-    end)
-
-    task.delay(0.45,function()
+        task.wait(0.65)
         if generation~=rightGeneration or player.Character~=char or not KorbloxSystem.RightEnabled then return end
-        applyRight(char)
+        if not rightIsCorrect(char) then applyRight(char) end
+        installRightWatchers(char,generation)
     end)
 end
-
 local function scheduleLeft(char)
     if not char or not KorbloxSystem.LeftEnabled then return end
-    leftGeneration+=1
-    local generation=leftGeneration
+    leftGeneration+=1; local generation=leftGeneration
     clearLeftCaptureForNewCharacter(char)
-
-    task.defer(function()
+    task.spawn(function()
+        char:WaitForChild("Humanoid",3); char:WaitForChild("LeftUpperLeg",3); char:WaitForChild("LeftLowerLeg",3); char:WaitForChild("LeftFoot",3)
         if generation~=leftGeneration or player.Character~=char or not KorbloxSystem.LeftEnabled then return end
         applyLeft(char)
-    end)
-
-    task.delay(0.45,function()
+        task.wait(0.65)
         if generation~=leftGeneration or player.Character~=char or not KorbloxSystem.LeftEnabled then return end
-        applyLeft(char)
+        if not leftIsCorrect(char) then applyLeft(char) end
+        installLeftWatchers(char,generation)
     end)
 end
 
-KorbloxSystem.ApplyRight=applyRight
-KorbloxSystem.RemoveRight=removeRight
-KorbloxSystem.ApplyLeft=applyLeft
-KorbloxSystem.RemoveLeft=removeLeft
-KorbloxSystem.ScheduleRight=scheduleRight
-KorbloxSystem.ScheduleLeft=scheduleLeft
-
+KorbloxSystem.ApplyRight=applyRight; KorbloxSystem.RemoveRight=removeRight
+KorbloxSystem.ApplyLeft=applyLeft; KorbloxSystem.RemoveLeft=removeLeft
+KorbloxSystem.ScheduleRight=scheduleRight; KorbloxSystem.ScheduleLeft=scheduleLeft
 KorbloxSystem.Schedule=function(char)
     if not char then return end
     if KorbloxSystem.RightEnabled then scheduleRight(char) end
     if KorbloxSystem.LeftEnabled then scheduleLeft(char) end
 end
-
 KorbloxSystem.Reset=function()
-    removeRight()
-    removeLeft()
-    KorbloxSystem.RightEnabled=false
-    KorbloxSystem.LeftEnabled=false
+    removeRight(); removeLeft(); KorbloxSystem.RightEnabled=false; KorbloxSystem.LeftEnabled=false
 end
 
-KorbloxSystem.RightToggle=addToggle(
-    characterSection,
-    "Korblox Right Leg",
-    KorbloxSystem.RightEnabled,
-    function(state)
-        KorbloxSystem.RightEnabled=state
-        SetCfg("korbloxEnabled",state)
-        if state then scheduleRight(player.Character) else removeRight() end
-    end
-)
-
-KorbloxSystem.LeftToggle=addToggle(
-    characterSection,
-    "Korblox Left Leg",
-    KorbloxSystem.LeftEnabled,
-    function(state)
-        KorbloxSystem.LeftEnabled=state
-        SetCfg("korbloxLeftEnabled",state)
-        if state then scheduleLeft(player.Character) else removeLeft() end
-    end
-)
+KorbloxSystem.RightToggle=addToggle(characterSection,"Korblox Right Leg",KorbloxSystem.RightEnabled,function(state)
+    KorbloxSystem.RightEnabled=state; SetCfg("korbloxEnabled",state)
+    if state then scheduleRight(player.Character) else removeRight() end
+end)
+KorbloxSystem.LeftToggle=addToggle(characterSection,"Korblox Left Leg",KorbloxSystem.LeftEnabled,function(state)
+    KorbloxSystem.LeftEnabled=state; SetCfg("korbloxLeftEnabled",state)
+    if state then scheduleLeft(player.Character) else removeLeft() end
+end)
 end)()
 
 characterSection:AddParagraph(
