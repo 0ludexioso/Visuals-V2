@@ -38,6 +38,17 @@ local read = type(readfile) == "function" and readfile or env.readfile
 local write = type(writefile) == "function" and writefile or env.writefile
 local exists = type(isfile) == "function" and isfile or env.isfile
 
+-- A fresh install means this add-on has never created its own settings JSON.
+-- On that first execution, every boolean control is explicitly seeded OFF.
+local configExistedAtStart=false
+if type(exists)=="function" then
+    local ok,result=pcall(exists,CFG_FILE)
+    configExistedAtStart=ok and result==true
+elseif type(read)=="function" then
+    configExistedAtStart=pcall(read,CFG_FILE)
+end
+local freshInstall=not configExistedAtStart
+
 local function isPositionKey(key)
     return type(key) == "string" and key:lower():find("position", 1, true) ~= nil
 end
@@ -106,12 +117,22 @@ end
 local function C(key, default)
     local source = isPositionKey(key) and PositionData or ConfigData
     local value = source[key]
+
     if value == nil then
-        if default ~= nil then
-            source[key] = encodeConfigValue(default)
+        -- Never ship a first-install toggle already enabled. Non-boolean style
+        -- defaults (sizes, colors, dropdown choices, positions) keep their
+        -- intended defaults and are pre-seeded into the same JSON.
+        local seededDefault=default
+        if freshInstall and type(default)=="boolean" then
+            seededDefault=false
         end
-        return default
+
+        if seededDefault ~= nil then
+            source[key]=encodeConfigValue(seededDefault)
+        end
+        return seededDefault
     end
+
     return decodeConfigValue(value, default)
 end
 
@@ -1138,9 +1159,22 @@ local headlessToggle = addToggle(characterSection, "Headless", headlessEnabled, 
     applyCharacterVisuals()
 end)
 
-local noInterruptionEmote=C("noInterruptionEmote",false)
-local emotePhysicsConnection=nil
+characterSection:AddParagraph(
+    "No Interruption Emote",
+    "Automatic: protection turns on only while an emote is playing and restores normal movement/physics as soon as the emote ends."
+)
+
+local emoteProtectionActive=false
 local emoteOriginal=setmetatable({}, {__mode="k"})
+local emoteConnections={}
+local activeEmoteTracks=setmetatable({}, {__mode="k"})
+
+local function disconnectEmoteConnections()
+    for _,conn in ipairs(emoteConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(emoteConnections)
+end
 
 local function rememberEmotePart(part)
     if not part or not part:IsA("BasePart") or emoteOriginal[part] then return end
@@ -1153,10 +1187,7 @@ local function rememberEmotePart(part)
 end
 
 local function restoreEmotePhysics()
-    if emotePhysicsConnection then
-        emotePhysicsConnection:Disconnect()
-        emotePhysicsConnection=nil
-    end
+    emoteProtectionActive=false
 
     for part,data in pairs(emoteOriginal) do
         if part and part.Parent and part:IsA("BasePart") then
@@ -1166,17 +1197,17 @@ local function restoreEmotePhysics()
             pcall(function() part.Anchored=data.Anchored end)
         end
     end
+
     emoteOriginal=setmetatable({}, {__mode="k"})
 end
 
-local function applyNoInterruptionEmote()
-    restoreEmotePhysics()
-    if not noInterruptionEmote then return end
-
+local function protectCurrentEmote()
     local char=player.Character
     if not char then return end
     local root=char:FindFirstChild("HumanoidRootPart")
     if not root then return end
+
+    emoteProtectionActive=true
 
     for _,obj in ipairs(char:GetDescendants()) do
         if obj:IsA("BasePart") then
@@ -1187,50 +1218,148 @@ local function applyNoInterruptionEmote()
         end
     end
 
+    -- Anchor only for the lifetime of the emote. It is restored immediately
+    -- when the last detected emote track stops.
+    rememberEmotePart(root)
     root.Anchored=true
     root.AssemblyLinearVelocity=Vector3.zero
     root.AssemblyAngularVelocity=Vector3.zero
+end
 
-    emotePhysicsConnection=RunService.Stepped:Connect(function()
-        if not noInterruptionEmote then return end
-        local currentChar=player.Character
-        local currentRoot=currentChar and currentChar:FindFirstChild("HumanoidRootPart")
-        if not currentRoot then return end
+local function numericAnimationId(animationId)
+    if type(animationId)~="string" then return nil end
+    return tonumber(animationId:match("(%d+)"))
+end
 
-        for _,obj in ipairs(currentChar:GetDescendants()) do
-            if obj:IsA("BasePart") then
-                rememberEmotePart(obj)
-                obj.CanCollide=false
-                obj.CanTouch=false
-                obj.Massless=true
+local function collectAvatarEmoteIds(humanoid)
+    local ids={}
+    local ok,description=pcall(function()
+        return humanoid:GetAppliedDescription()
+    end)
+    if not ok or not description then return ids end
+
+    local okEmotes,emotes=pcall(function()
+        return description:GetEmotes()
+    end)
+    if okEmotes and type(emotes)=="table" then
+        for _,idList in pairs(emotes) do
+            if type(idList)=="table" then
+                for _,id in ipairs(idList) do
+                    local n=tonumber(id)
+                    if n then ids[n]=true end
+                end
             end
         end
+    end
 
-        currentRoot.Anchored=true
-        currentRoot.AssemblyLinearVelocity=Vector3.zero
-        currentRoot.AssemblyAngularVelocity=Vector3.zero
+    return ids
+end
+
+local function isLikelyEmoteTrack(track,humanoid)
+    if not track then return false end
+
+    local name=tostring(track.Name or ""):lower()
+    local animation=track.Animation
+    local animationId=animation and numericAnimationId(animation.AnimationId)
+
+    -- Roblox avatar emotes from the player's HumanoidDescription.
+    local avatarIds=collectAvatarEmoteIds(humanoid)
+    if animationId and avatarIds[animationId] then
+        return true
+    end
+
+    -- Common/default and game-provided emote naming.
+    local hints={
+        "emote","dance","wave","point","laugh","cheer","pose",
+        "sit","salute","clap","shrug","bow","idle emote"
+    }
+    for _,hint in ipairs(hints) do
+        if name:find(hint,1,true) then
+            return true
+        end
+    end
+
+    if animation then
+        local animName=tostring(animation.Name or ""):lower()
+        for _,hint in ipairs(hints) do
+            if animName:find(hint,1,true) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function anyActiveEmote()
+    for track in pairs(activeEmoteTracks) do
+        if track and track.IsPlaying then
+            return true
+        end
+    end
+    return false
+end
+
+local function finishEmoteTrack(track)
+    activeEmoteTracks[track]=nil
+    task.defer(function()
+        if not anyActiveEmote() then
+            restoreEmotePhysics()
+        end
     end)
 end
 
-local noInterruptionToggle=addToggle(
-    characterSection,
-    "No Interruption Emote",
-    noInterruptionEmote,
-    function(state)
-        noInterruptionEmote=state
-        SetCfg("noInterruptionEmote",state)
-        applyNoInterruptionEmote()
+local function watchEmoteTrack(track,humanoid)
+    if not isLikelyEmoteTrack(track,humanoid) then return end
+    if activeEmoteTracks[track] then return end
+
+    activeEmoteTracks[track]=true
+    protectCurrentEmote()
+
+    local stopped
+    stopped=track.Stopped:Connect(function()
+        if stopped then stopped:Disconnect() end
+        finishEmoteTrack(track)
+    end)
+    table.insert(emoteConnections,stopped)
+end
+
+local function setupAutomaticEmoteProtection(char)
+    disconnectEmoteConnections()
+    restoreEmotePhysics()
+    table.clear(activeEmoteTracks)
+
+    if not char then return end
+    local humanoid=char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid",5)
+    if not humanoid then return end
+
+    local animator=humanoid:FindFirstChildOfClass("Animator") or humanoid:WaitForChild("Animator",5)
+    if not animator then return end
+
+    table.insert(emoteConnections,animator.AnimationPlayed:Connect(function(track)
+        watchEmoteTrack(track,humanoid)
+    end))
+
+    -- Catch an emote that was already playing when the add-on loaded.
+    for _,track in ipairs(animator:GetPlayingAnimationTracks()) do
+        watchEmoteTrack(track,humanoid)
     end
-)
+end
+
+if player.Character then
+    task.defer(function()
+        setupAutomaticEmoteProtection(player.Character)
+    end)
+end
 
 env.VisualsV2Runtime.RegisterReset(function()
     headlessToggle:Set(false)
     headlessEnabled=false
     applyCharacterVisuals()
 
-    noInterruptionToggle:Set(false)
-    noInterruptionEmote=false
+    disconnectEmoteConnections()
     restoreEmotePhysics()
+    table.clear(activeEmoteTracks)
 end)
 
 -- =========================================================
@@ -3577,14 +3706,12 @@ local function onCharacterAdded(char)
     if skinTrailEnabled then applySkinTrail(); refreshSkinTrailRainbowConnection() end
     if auraEnabled then applyAura() end
     if headlessEnabled then applyCharacterVisuals() end
-    if noInterruptionEmote then applyNoInterruptionEmote() end
+    setupAutomaticEmoteProtection(char)
     setupJumpCircles(char)
     task.delay(0.5,setupSpeedButtons)
 end
 if player.Character then task.defer(function() onCharacterAdded(player.Character) end) end
 player.CharacterAdded:Connect(onCharacterAdded)
-
-saveConfig()
 
 saveConfig()
 
