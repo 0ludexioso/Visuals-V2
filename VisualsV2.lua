@@ -5719,6 +5719,7 @@ end)()
 local creditsSection=mainTab:AddSection("Credits","")
 
 creditsSection:AddLabel("Belfor — 1306953439238164551")
+creditsSection:AddLabel("mrdaniel307228 — 1306953439238164551")
 creditsSection:AddLabel("SANGUINE — 1190101169184460931")
 creditsSection:AddLabel("NICOLAS — 1163360113092997120")
 creditsSection:AddLabel("b6o6s, A — 718910264942002277")
