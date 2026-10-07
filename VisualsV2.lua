@@ -4522,6 +4522,33 @@ local function disconnect(conn)
     if conn then pcall(function() conn:Disconnect() end) end
 end
 
+-- Traffic-light countdown colors: green -> yellow -> red as remaining time drops.
+-- The visible text fades from the status color into black from left to right.
+local TIMER_RED=Color3.fromRGB(255,0,0)
+local TIMER_YELLOW=Color3.fromRGB(255,255,0)
+local TIMER_GREEN=Color3.fromRGB(0,255,0)
+local TIMER_BLACK=Color3.fromRGB(0,0,0)
+
+local function fireflyTimerColor(remaining,total)
+    remaining=math.max(0,tonumber(remaining) or 0)
+    total=math.max(0.001,tonumber(total) or 1)
+    local ratio=math.clamp(remaining/total,0,1)
+    if ratio>=(2/3) then return TIMER_GREEN end
+    if ratio>=(1/3) then return TIMER_YELLOW end
+    return TIMER_RED
+end
+
+local function applyFireflyColor(color)
+    if not timerLabel then return end
+    timerLabel.TextColor3=Color3.new(1,1,1)
+    if timerGradient then
+        timerGradient.Color=ColorSequence.new({
+            ColorSequenceKeypoint.new(0,color),
+            ColorSequenceKeypoint.new(1,TIMER_BLACK),
+        })
+    end
+end
+
 local function clearTimerGuis()
     local pg=player:FindFirstChildOfClass("PlayerGui")
     if not pg then return end
@@ -4529,41 +4556,6 @@ local function clearTimerGuis()
         local old=pg:FindFirstChild(name)
         if old and old~=gui then pcall(function() old:Destroy() end) end
     end
-end
-
-local TIMER_GREEN=Color3.fromRGB(0,255,0)
-local TIMER_YELLOW=Color3.fromRGB(255,200,0)
-local TIMER_RED=Color3.fromRGB(255,0,0)
-local TIMER_BLACK=Color3.fromRGB(0,0,0)
-
-local function timerPhaseColor(remaining,total)
-    total=math.max(tonumber(total) or 0,0.001)
-    local ratio=math.clamp((tonumber(remaining) or 0)/total,0,1)
-    if ratio>=(2/3) then
-        return TIMER_GREEN
-    elseif ratio>=(1/3) then
-        return TIMER_YELLOW
-    end
-    return TIMER_RED
-end
-
-local function setTimerGradient(color)
-    if not timerLabel then return end
-
-    timerLabel.TextColor3=Color3.new(1,1,1)
-
-    if not timerGradient or timerGradient.Parent~=timerLabel then
-        timerGradient=Instance.new("UIGradient")
-        timerGradient.Name="VisualsV2_FireflyColorGradient"
-        timerGradient.Rotation=90
-        timerGradient.Parent=timerLabel
-    end
-
-    timerGradient.Enabled=true
-    timerGradient.Color=ColorSequence.new({
-        ColorSequenceKeypoint.new(0,color),
-        ColorSequenceKeypoint.new(1,TIMER_BLACK),
-    })
 end
 
 local function applyTimerSize()
@@ -4597,8 +4589,14 @@ local function buildTimer()
     timerLabel.Visible=false
     timerLabel.Active=true
     timerLabel.Parent=gui
+
+    timerGradient=Instance.new("UIGradient")
+    timerGradient.Name="VisualsV2_FireflyTimerGradient"
+    timerGradient.Rotation=0
+    timerGradient.Color=ColorSequence.new(TIMER_BLACK)
+    timerGradient.Parent=timerLabel
+
     applyTimerSize()
-    setTimerGradient(TIMER_GREEN)
 
     local dragging=false
     local moved=false
@@ -4666,7 +4664,11 @@ local function stopCycle()
     cycleStartedAt=nil
     countdownEndsAt=nil
     cooldownEndsAt=nil
-    if timerLabel then timerLabel.Visible=false; timerLabel.Text="" end
+    if timerLabel then
+        timerLabel.Visible=false
+        timerLabel.Text=""
+        applyFireflyColor(TIMER_BLACK)
+    end
 end
 
 -- Same activation/cooldown/jump behavior as the attached FFC addon. The only
@@ -4682,7 +4684,6 @@ local function startCountdown()
     countdownConnection=RunService.Heartbeat:Connect(function()
         if not countdownEndsAt then return end
         local remaining=countdownEndsAt-os.clock()
-        setTimerGradient(timerPhaseColor(remaining,COUNTDOWN))
         if remaining<=0 then
             disconnect(countdownConnection)
             countdownConnection=nil
@@ -4693,6 +4694,7 @@ local function startCountdown()
             startTwoJumpSequence(cycleToken)
         end
         timerLabel.Text=string.format("%.1fCD",math.max(0,remaining))
+        applyFireflyColor(fireflyTimerColor(remaining,COUNTDOWN))
     end)
 end
 
@@ -4705,10 +4707,9 @@ local function startCooldownPanel()
         local now=os.clock()
         if countdownEndsAt and now<countdownEndsAt then return end
         local remaining=cooldownEndsAt-now
-        setTimerGradient(timerPhaseColor(remaining,math.max(0.001,COOLDOWN-COUNTDOWN)))
         if remaining<=0 then
-            setTimerGradient(TIMER_GREEN)
             timerLabel.Text="Active"
+            applyFireflyColor(TIMER_GREEN)
             task.delay(0.6,function()
                 if timerLabel and not isOnCooldown then timerLabel.Visible=false; timerLabel.Text="" end
             end)
@@ -4718,6 +4719,7 @@ local function startCooldownPanel()
         end
         timerLabel.Visible=true
         timerLabel.Text=string.format("%.1fCD",remaining)
+        applyFireflyColor(fireflyTimerColor(remaining,COOLDOWN))
     end)
 end
 
@@ -4849,6 +4851,7 @@ local function unhookTool()
     if timerLabel then
         timerLabel.Visible=false
         timerLabel.Text=""
+        applyFireflyColor(TIMER_BLACK)
     end
 end
 
@@ -5606,30 +5609,56 @@ saveConfig()
 local performanceTab=mainTab
 
 ;(function()
-local section=performanceTab:AddSection("FPS & Ping Monitor","Performance")
+local section=performanceTab:AddSection("FPS, Ping & players monitor","Performance")
 local Stats=game:GetService("Stats")
 
 local enabled=C("vv2FpsPingEnabled",false)
 local colors=C("vv2FpsPingColors",false)
-local pos=C("vv2FpsPingPosition","Top Right")
-local lockPosition=C("vv2FpsPingLocked",false)
+local locked=C("vv2MonitorLocked",false)
 
-local gui,holder,fps,ping,playersStat,conn
+-- Monitor size range v2:
+-- 1 = 0.25x the original fixed 120x25 size, 4 = original size,
+-- 8 = 2x, and 10 = 3x. Existing 1-5 settings are migrated once.
+local storedSize=math.floor(tonumber(C("vv2MonitorSize",4)) or 4)
+local sizeRangeVersion=math.floor(tonumber(C("vv2MonitorSizeRangeVersion",1)) or 1)
+if sizeRangeVersion<2 then
+    local oldToNew={[1]=2,[2]=3,[3]=3,[4]=4,[5]=4}
+    storedSize=oldToNew[math.clamp(storedSize,1,5)] or 4
+    SetCfg("vv2MonitorSize",storedSize)
+    SetCfg("vv2MonitorSizeRangeVersion",2)
+end
+local sizeLevel=math.clamp(storedSize,1,10)
+
+-- These are display choices, not feature auto-enables. FPS and Ping default on
+-- even on a clean config; Players remains optional/off until the user enables it.
+local function statSetting(key,default)
+    local value=ConfigData[key]
+    if value==nil then
+        ConfigData[key]=default
+        return default
+    end
+    return not not value
+end
+local showFPS=statSetting("vv2ShowFPS",true)
+local showPing=statSetting("vv2ShowPing",true)
+local showPlayers=statSetting("vv2ShowPlayers",false)
+
+local DEFAULT_MONITOR_POS=UDim2.new(0.5,0,0,15)
+local gui,holder,fps,ping,playersLabel,renderConn
 local fpsGradient,pingGradient,playersGradient
-local dragConnections={}
-
-local presets={
-    ["Top Right"]=UDim2.new(.80,0,0,15),
-    ["Top Left"]=UDim2.new(.02,0,0,15),
-    ["Top Center"]=UDim2.new(.44,0,0,15),
-    ["Bottom Right"]=UDim2.new(.80,0,.85,0),
-    ["Bottom Left"]=UDim2.new(.02,0,.85,0)
-}
+local inputConnections={}
+local masterToggle,colorToggle,fpsToggle,pingToggle,playersToggle,lockToggle
 
 local GREEN=Color3.fromRGB(0,255,0)
-local YELLOW=Color3.fromRGB(255,200,0)
+local YELLOW=Color3.fromRGB(255,255,0)
 local RED=Color3.fromRGB(255,0,0)
 local BLACK=Color3.fromRGB(0,0,0)
+
+local function notifyAtLeastOne()
+    pcall(function()
+        shared.Notify("At least 1 stat has to be toggled for the monitor to stay on.",3)
+    end)
+end
 
 local function root()
     if type(gethui)=="function" then
@@ -5639,49 +5668,79 @@ local function root()
     return player:WaitForChild("PlayerGui")
 end
 
-local function unpackPosition(data)
-    if type(data)~="table" then return nil end
-    local xs=tonumber(data.xs or data.XS)
-    local xo=tonumber(data.xo or data.XO)
-    local ys=tonumber(data.ys or data.YS)
-    local yo=tonumber(data.yo or data.YO)
-    if xs==nil or xo==nil or ys==nil or yo==nil then return nil end
-    return UDim2.new(xs,xo,ys,yo)
+local function anyStatEnabled()
+    return showFPS or showPing or showPlayers
 end
 
-local savedPosition=C("vv2FpsPingSavedPosition",nil)
-local currentPosition=unpackPosition(savedPosition) or presets[pos] or presets["Top Right"]
-
-local function saveMonitorPosition(position)
-    currentPosition=position
-    SetCfg("vv2FpsPingSavedPosition",{
-        xs=position.X.Scale,
-        xo=position.X.Offset,
-        ys=position.Y.Scale,
-        yo=position.Y.Offset,
-    })
-end
-
-local function setMonitorPosition(position,saveIt)
-    currentPosition=position
-    if holder then holder.Position=position end
-    if saveIt then saveMonitorPosition(position) end
-end
-
-local function usePreset(name,saveIt)
-    local p=presets[name] or presets["Top Right"]
-    setMonitorPosition(p,saveIt)
-end
-
-local function playerCountColor(count)
-    count=math.clamp(tonumber(count) or 1,1,12)
-    if count>=9 then
-        return GREEN
-    elseif count>=5 then
-        return YELLOW
-    end
+local function colorFPS(value)
+    local cap=tonumber(workspace:GetAttribute("FPSCap")) or 60
+    if value>=cap*.85 then return GREEN end
+    if value>=cap*.50 then return YELLOW end
     return RED
 end
+
+local function colorPing(value)
+    if value<=80 then return GREEN end
+    if value<=150 then return YELLOW end
+    return RED
+end
+
+local function colorPlayers(value)
+    value=math.clamp(tonumber(value) or 1,1,12)
+    if value<=4 then return GREEN end
+    if value<=8 then return YELLOW end
+    return RED
+end
+
+local MONITOR_SIZE_MULTIPLIERS={
+    0.25, -- 1: quarter-size
+    0.50, -- 2: half-size
+    0.75, -- 3
+    1.00, -- 4: original fixed size
+    1.25, -- 5
+    1.50, -- 6
+    1.75, -- 7
+    2.00, -- 8: twice original
+    2.50, -- 9
+    3.00, -- 10: three times original
+}
+
+local function sizeScale()
+    return MONITOR_SIZE_MULTIPLIERS[sizeLevel] or 1
+end
+
+local function refreshLayout()
+    if not holder then return end
+
+    local scale=sizeScale()
+    local width=math.max(1,math.floor(120*scale+0.5))
+    local height=math.max(1,math.floor(25*scale+0.5))
+    local gap=math.max(1,math.floor(3*scale+0.5))
+    local y=0
+    local count=0
+
+    local function placeLabel(label,visible)
+        if not label then return end
+        label.Visible=visible
+        label.Size=UDim2.fromOffset(width,height)
+        if visible then
+            label.Position=UDim2.fromOffset(0,y)
+            y+=height+gap
+            count+=1
+        end
+    end
+
+    placeLabel(fps,showFPS)
+    placeLabel(ping,showPing)
+    placeLabel(playersLabel,showPlayers)
+
+    local totalHeight=(count>0) and (count*height+(count-1)*gap) or height
+    holder.Size=UDim2.fromOffset(width,totalHeight)
+end
+
+local lastFps=0
+local lastPing=0
+local lastPlayers=#Players:GetPlayers()
 
 local function statusSequence(color)
     return ColorSequence.new({
@@ -5690,80 +5749,140 @@ local function statusSequence(color)
     })
 end
 
-local function createGradient(label,name)
-    local gradient=Instance.new("UIGradient")
-    gradient.Name=name
-    gradient.Rotation=90
-    gradient.Color=statusSequence(GREEN)
-    gradient.Parent=label
-    return gradient
+local function applyStatColor(label,gradient,color)
+    if not label or not gradient then return end
+    label.TextColor3=Color3.new(1,1,1)
+    gradient.Color=statusSequence(color)
 end
 
-local function applyStatusStyle(label,gradient,color)
-    if not label then return end
-
-    if colors and gradient then
-        label.TextColor3=Color3.new(1,1,1)
-        gradient.Enabled=true
-        gradient.Color=statusSequence(color)
-    else
-        if gradient then gradient.Enabled=false end
-        label.TextColor3=BLACK
-    end
+local function refreshColors()
+    applyStatColor(fps,fpsGradient,colors and colorFPS(lastFps) or BLACK)
+    applyStatColor(ping,pingGradient,colors and colorPing(lastPing) or BLACK)
+    applyStatColor(playersLabel,playersGradient,colors and colorPlayers(lastPlayers) or BLACK)
 end
 
-local function disconnectDrag()
-    for _,c in ipairs(dragConnections) do
+local function disconnectInputConnections()
+    for _,c in ipairs(inputConnections) do
         pcall(function() c:Disconnect() end)
     end
-    table.clear(dragConnections)
+    table.clear(inputConnections)
 end
 
-local function enableDragging()
-    disconnectDrag()
-    if not holder then return end
+local function destroy()
+    if renderConn then renderConn:Disconnect(); renderConn=nil end
+    disconnectInputConnections()
+    if gui then gui:Destroy(); gui=nil end
+    holder=nil
+    fps=nil
+    ping=nil
+    playersLabel=nil
+    fpsGradient=nil
+    pingGradient=nil
+    playersGradient=nil
+end
 
-    local dragging=false
-    local dragMode=nil
-    local touchInput=nil
-    local dragStart=nil
-    local startPos=nil
+local function createLabel(name)
+    local label=Instance.new("TextLabel")
+    label.Name=name
+    label.BackgroundTransparency=1
+    label.BorderSizePixel=0
+    label.Font=Enum.Font.SourceSansLight
+    label.TextScaled=true
+    label.TextStrokeTransparency=1
+    label.TextColor3=Color3.new(1,1,1)
+    label.Text="0"
+    label.Active=true
+    label.Parent=holder
 
-    local function begin(input)
-        if lockPosition then return end
+    local gradient=Instance.new("UIGradient")
+    gradient.Name=name.."Gradient"
+    gradient.Rotation=0
+    gradient.Color=statusSequence(BLACK)
+    gradient.Parent=label
 
-        if input.UserInputType==Enum.UserInputType.MouseButton1 then
-            dragging=true
-            dragMode="mouse"
-            dragStart=input.Position
-            startPos=holder.Position
-        elseif input.UserInputType==Enum.UserInputType.Touch then
-            dragging=true
-            dragMode="touch"
-            touchInput=input
-            dragStart=input.Position
-            startPos=holder.Position
+    return label,gradient
+end
+
+local function create()
+    destroy()
+
+    if not anyStatEnabled() then
+        showFPS=true
+        SetCfg("vv2ShowFPS",true)
+        if fpsToggle then task.defer(function() fpsToggle:Set(true) end) end
+        notifyAtLeastOne()
+    end
+
+    gui=Instance.new("ScreenGui")
+    gui.Name="VisualsV2_FpsPingPlayersMonitor"
+    gui.ResetOnSpawn=false
+    gui.IgnoreGuiInset=true
+    gui.Parent=root()
+
+    holder=Instance.new("Frame")
+    holder.Name="VisualsV2_MonitorHolder"
+    holder.AnchorPoint=Vector2.new(0.5,0)
+    holder.Position=loadStoredPosition("vv2MonitorPosition",DEFAULT_MONITOR_POS)
+    holder.BackgroundTransparency=1
+    holder.BorderSizePixel=0
+    holder.Active=true
+    holder.Parent=gui
+
+    fps,fpsGradient=createLabel("VisualsV2_FPS")
+    ping,pingGradient=createLabel("VisualsV2_Ping")
+    playersLabel,playersGradient=createLabel("VisualsV2_Players")
+
+    local function refreshPlayerCount()
+        lastPlayers=#Players:GetPlayers()
+        if playersLabel then
+            playersLabel.Text=tostring(lastPlayers)
+            applyStatColor(playersLabel,playersGradient,colors and colorPlayers(lastPlayers) or BLACK)
         end
     end
 
-    local function bindInput(guiObject)
-        guiObject.Active=true
-        table.insert(dragConnections,guiObject.InputBegan:Connect(begin))
+    refreshPlayerCount()
+    table.insert(inputConnections,Players.PlayerAdded:Connect(function()
+        task.defer(refreshPlayerCount)
+    end))
+    table.insert(inputConnections,Players.PlayerRemoving:Connect(function()
+        -- PlayerRemoving can fire just before GetPlayers() drops the leaving player.
+        task.defer(refreshPlayerCount)
+    end))
+
+    refreshLayout()
+    refreshColors()
+
+    local dragging=false
+    local moved=false
+    local dragInput,dragStart,startPos
+
+    local function beginDrag(input)
+        if locked then return end
+        if input.UserInputType~=Enum.UserInputType.MouseButton1 and input.UserInputType~=Enum.UserInputType.Touch then return end
+        dragging=true
+        moved=false
+        dragInput=input
+        dragStart=input.Position
+        startPos=holder.Position
     end
 
-    bindInput(holder)
-    bindInput(fps)
-    bindInput(ping)
-    bindInput(playersStat)
+    local function changed(input)
+        if input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch then
+            dragInput=input
+        end
+    end
 
-    table.insert(dragConnections,UserInputService.InputChanged:Connect(function(input)
-        if not dragging or lockPosition or not holder or not dragStart or not startPos then return end
+    -- Connect the holder and each visible stat so dragging works reliably even
+    -- when a TextLabel is the topmost object under the mouse/finger.
+    for _,obj in ipairs({holder,fps,ping,playersLabel}) do
+        table.insert(inputConnections,obj.InputBegan:Connect(beginDrag))
+        table.insert(inputConnections,obj.InputChanged:Connect(changed))
+    end
 
-        local valid=(dragMode=="mouse" and input.UserInputType==Enum.UserInputType.MouseMovement)
-            or (dragMode=="touch" and input==touchInput)
-        if not valid then return end
-
+    table.insert(inputConnections,UserInputService.InputChanged:Connect(function(input)
+        if locked or not dragging or input~=dragInput or not holder then return end
         local delta=input.Position-dragStart
+        if delta.Magnitude>7 then moved=true end
         holder.Position=UDim2.new(
             startPos.X.Scale,
             startPos.X.Offset+delta.X,
@@ -5772,208 +5891,129 @@ local function enableDragging()
         )
     end))
 
-    table.insert(dragConnections,UserInputService.InputEnded:Connect(function(input)
-        local finished=(dragMode=="mouse" and input.UserInputType==Enum.UserInputType.MouseButton1)
-            or (dragMode=="touch" and input==touchInput)
-        if not dragging or not finished then return end
-
+    table.insert(inputConnections,UserInputService.InputEnded:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType~=Enum.UserInputType.MouseButton1 and input.UserInputType~=Enum.UserInputType.Touch then return end
         dragging=false
-        dragMode=nil
-        touchInput=nil
-
-        if holder then
-            saveMonitorPosition(holder.Position)
+        if moved and holder then
+            saveStoredPosition("vv2MonitorPosition",holder.Position)
         end
     end))
-end
 
-local function destroy()
-    if conn then conn:Disconnect(); conn=nil end
-    disconnectDrag()
-
-    if gui then
-        gui:Destroy()
-        gui=nil
-    end
-
-    holder=nil
-    fps=nil
-    ping=nil
-    playersStat=nil
-    fpsGradient=nil
-    pingGradient=nil
-    playersGradient=nil
-end
-
-local function create()
-    destroy()
-
-    gui=Instance.new("ScreenGui")
-    gui.Name="VisualsV2_FpsPingMonitor"
-    gui.ResetOnSpawn=false
-    gui.Parent=root()
-
-    holder=Instance.new("Frame")
-    holder.Name="VisualsV2_StatsHolder"
-    holder.BackgroundTransparency=1
-    holder.Size=UDim2.new(0,120,0,81)
-    holder.Position=currentPosition
-    holder.Parent=gui
-
-    fps=Instance.new("TextLabel")
-    fps.Name="VisualsV2_FPS"
-    fps.BackgroundTransparency=1
-    fps.Size=UDim2.new(0,120,0,25)
-    fps.Position=UDim2.new(0,0,0,0)
-    fps.Font=Enum.Font.SourceSansLight
-    fps.TextScaled=true
-    fps.TextColor3=BLACK
-    fps.TextStrokeTransparency=1
-    fps.Parent=holder
-    fpsGradient=createGradient(fps,"VisualsV2_FPSGradient")
-
-    ping=Instance.new("TextLabel")
-    ping.Name="VisualsV2_Ping"
-    ping.BackgroundTransparency=1
-    ping.Size=fps.Size
-    ping.Position=UDim2.new(0,0,0,28)
-    ping.Font=Enum.Font.SourceSansLight
-    ping.TextScaled=true
-    ping.TextColor3=BLACK
-    ping.TextStrokeTransparency=1
-    ping.Parent=holder
-    pingGradient=createGradient(ping,"VisualsV2_PingGradient")
-
-    playersStat=Instance.new("TextLabel")
-    playersStat.Name="VisualsV2_Players"
-    playersStat.BackgroundTransparency=1
-    playersStat.Size=fps.Size
-    playersStat.Position=UDim2.new(0,0,0,56)
-    playersStat.Font=Enum.Font.SourceSansLight
-    playersStat.TextScaled=true
-    playersStat.TextColor3=BLACK
-    playersStat.TextStrokeTransparency=1
-    playersStat.Parent=holder
-    playersGradient=createGradient(playersStat,"VisualsV2_PlayersGradient")
-
-    enableDragging()
-
-    local lastFps=-1
-    local lastPing=-1
-    local lastPlayers=-1
     local lastSlowUpdate=0
+    renderConn=RunService.RenderStepped:Connect(function(dt)
+        if not holder then return end
 
-    conn=RunService.RenderStepped:Connect(function(dt)
-        local f=math.floor(1/dt+.5)
-        if f~=lastFps then
-            lastFps=f
-            fps.Text=tostring(f)
-        end
+        lastFps=math.max(0,math.floor((dt>0 and 1/dt or 0)+0.5))
+        fps.Text=tostring(lastFps)
+        applyStatColor(fps,fpsGradient,colors and colorFPS(lastFps) or BLACK)
 
-        local cap=workspace:GetAttribute("FPSCap") or 60
-        local fpsColor=(f>=cap*.85 and GREEN)
-            or (f>=cap*.5 and YELLOW)
-            or RED
-        applyStatusStyle(fps,fpsGradient,fpsColor)
-
-        local now=os.clock()
-        if now-lastSlowUpdate>=.5 then
-            lastSlowUpdate=now
+        if os.clock()-lastSlowUpdate>=0.5 then
+            lastSlowUpdate=os.clock()
 
             local p=0
             pcall(function()
                 p=tonumber(Stats.Network.ServerStatsItem["Data Ping"]:GetValueString():match("%-?%d+")) or 0
             end)
+            lastPing=p
+            ping.Text=tostring(lastPing)
+            applyStatColor(ping,pingGradient,colors and colorPing(lastPing) or BLACK)
 
-            if p~=lastPing then
-                lastPing=p
-                ping.Text=tostring(p)
-            end
-
-            local count=#Players:GetPlayers()
-            if count~=lastPlayers then
-                lastPlayers=count
-                playersStat.Text=tostring(count).."/12"
-            end
-
-            local pingColor=(p<=80 and GREEN)
-                or (p<=150 and YELLOW)
-                or RED
-
-            applyStatusStyle(ping,pingGradient,pingColor)
-            applyStatusStyle(playersStat,playersGradient,playerCountColor(count))
+            lastPlayers=#Players:GetPlayers()
+            playersLabel.Text=tostring(lastPlayers)
+            applyStatColor(playersLabel,playersGradient,colors and colorPlayers(lastPlayers) or BLACK)
         end
     end)
 end
 
-local t=addToggle(section,"VV2 Enable Monitor UI",enabled,function(v)
+masterToggle=addToggle(section,"VV2 Enable Monitor UI",enabled,function(v)
     enabled=v
     SetCfg("vv2FpsPingEnabled",v)
-    if v then create() else destroy() end
+
+    if v then
+        if not anyStatEnabled() then
+            showFPS=true
+            SetCfg("vv2ShowFPS",true)
+            if fpsToggle then task.defer(function() fpsToggle:Set(true) end) end
+            notifyAtLeastOne()
+        end
+        create()
+    else
+        destroy()
+    end
 end)
 
-local c=addToggle(section,"VV2 Enable Statistic Colors",colors,function(v)
+colorToggle=addToggle(section,"VV2 Enable Statistic Colors",colors,function(v)
     colors=v
     SetCfg("vv2FpsPingColors",v)
-
-    if not v then
-        applyStatusStyle(fps,fpsGradient,BLACK)
-        applyStatusStyle(ping,pingGradient,BLACK)
-        applyStatusStyle(playersStat,playersGradient,BLACK)
-    end
+    refreshColors()
 end)
 
-local l=addToggle(section,"VV2 Lock Monitor Position",lockPosition,function(v)
-    lockPosition=v
-    SetCfg("vv2FpsPingLocked",v)
+fpsToggle=addToggle(section,"VV2 Show FPS",showFPS,function(v)
+    if not v and enabled and not showPing and not showPlayers then
+        showFPS=true
+        SetCfg("vv2ShowFPS",true)
+        notifyAtLeastOne()
+        task.defer(function() if fpsToggle then fpsToggle:Set(true) end end)
+        return
+    end
+    showFPS=v
+    SetCfg("vv2ShowFPS",v)
+    refreshLayout()
 end)
 
-local suppressInitialPreset=true
-local positionDropdown
-positionDropdown=addDropdown(
-    section,
-    "VV2 UI Position",
-    {"Top Right","Top Left","Top Center","Bottom Right","Bottom Left"},
-    pos,
-    function(v)
-        pos=v
-        SetCfg("vv2FpsPingPosition",v)
-
-        if suppressInitialPreset then
-            suppressInitialPreset=false
-            return
-        end
-
-        usePreset(v,true)
+pingToggle=addToggle(section,"VV2 Show Ping",showPing,function(v)
+    if not v and enabled and not showFPS and not showPlayers then
+        showPing=true
+        SetCfg("vv2ShowPing",true)
+        notifyAtLeastOne()
+        task.defer(function() if pingToggle then pingToggle:Set(true) end end)
+        return
     end
-)
+    showPing=v
+    SetCfg("vv2ShowPing",v)
+    refreshLayout()
+end)
 
-section:AddButton("VV2 Reset Monitor Position",function()
-    pos="Top Center"
-    SetCfg("vv2FpsPingPosition",pos)
-    usePreset(pos,true)
-
-    if positionDropdown and type(positionDropdown.Select)=="function" then
-        local ok=pcall(positionDropdown.Select,pos)
-        if not ok then
-            pcall(function() positionDropdown:Select(pos) end)
-        end
+playersToggle=addToggle(section,"VV2 Show Players",showPlayers,function(v)
+    if not v and enabled and not showFPS and not showPing then
+        showPlayers=true
+        SetCfg("vv2ShowPlayers",true)
+        notifyAtLeastOne()
+        task.defer(function() if playersToggle then playersToggle:Set(true) end end)
+        return
     end
+    showPlayers=v
+    SetCfg("vv2ShowPlayers",v)
+    refreshLayout()
+end)
+
+section:AddSlider("VV2 Monitor Size",1,10,sizeLevel,function(v)
+    sizeLevel=math.clamp(math.floor(tonumber(v) or 4),1,10)
+    SetCfg("vv2MonitorSize",sizeLevel)
+    SetCfg("vv2MonitorSizeRangeVersion",2)
+    refreshLayout()
+end)
+
+lockToggle=addToggle(section,"VV2 Lock Monitor Position",locked,function(v)
+    locked=v
+    SetCfg("vv2MonitorLocked",v)
+end)
+
+section:AddButton("Reset Monitor Position",function()
+    saveStoredPosition("vv2MonitorPosition",DEFAULT_MONITOR_POS)
+    if holder then holder.Position=DEFAULT_MONITOR_POS end
 end)
 
 env.VisualsV2Runtime.RegisterReset(function()
-    t:Set(false)
-    c:Set(false)
-    l:Set(false)
-
+    if masterToggle then masterToggle:Set(false) end
+    if colorToggle then colorToggle:Set(false) end
+    if lockToggle then lockToggle:Set(false) end
     enabled=false
     colors=false
-    lockPosition=false
-
+    locked=false
     destroy()
 end)
-
-if enabled then task.defer(create) end
 end)()
 
 ;(function()
