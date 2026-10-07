@@ -5675,9 +5675,9 @@ end
 
 local function playerCountColor(count)
     count=math.clamp(tonumber(count) or 1,1,12)
-    if count<=4 then
+    if count>=9 then
         return GREEN
-    elseif count<=8 then
+    elseif count>=5 then
         return YELLOW
     end
     return RED
