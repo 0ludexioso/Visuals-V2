@@ -1953,7 +1953,7 @@ KorbloxSystem.LeftToggle=addToggle(
 end)()
 characterSection:AddParagraph(
     "No interruption on emoting",
-    "Runs ATAOs-style True Anti Fling for as long as a Roblox avatar emote is playing, then turns it off."
+    "Disables player-character collision only while a Roblox avatar emote is playing."
 )
 
 local noInterruptionEmote=C("noInterruptionEmote",false)
@@ -1961,485 +1961,472 @@ local setupAutomaticEmoteProtection
 
 ;(function()
 -- ============================================================
--- NO INTERRUPTION ON EMOTING (self-contained)
+-- NO INTERRUPTION ON EMOTING
 --
--- While a Roblox avatar emote track is playing on the local Animator, this
--- runs ATAOs' True/IY Anti Fling step on RunService.Stepped:
---     every other player -> every BasePart in their Character -> CanCollide=false
--- When the last emote track is gone the step is disconnected and every part
--- this feature switched off is switched back on.
+-- Detection is deliberately ID-based instead of trying to infer an emote
+-- from movement or where an Animation instance is parented.  Roblox avatar
+-- emote ids are read from the local HumanoidDescription, with the account
+-- avatar description used as a fallback.  Classic /e emotes are included too.
 --
--- It never plays, stops, seeks, replaces or freezes an animation, never
--- anchors anything, and never touches the local character or its description.
+-- While a recognised avatar emote is playing, collision protection uses the
+-- exact idea from the supplied template: every player character (including
+-- the local character) has BasePart.CanCollide forced false.  DescendantAdded
+-- keeps new parts covered, and a Stepped pass keeps the state enforced if
+-- another character script changes CanCollide during the emote.
 --
--- Detection is by animation track lifetime (Animator.AnimationPlayed ->
--- AnimationTrack.Stopped, backed by IsPlaying / GetPlayingAnimationTracks),
--- never by movement. Each new track is classified once:
---   1. known locomotion / user-excluded id            -> not an emote
---   2. lives inside the character's Animate script    -> emote only if it sits
---      in an emote group (wave/point/dance*/laugh/cheer), otherwise locomotion
---   3. lives inside a Tool or elsewhere in the game   -> not an emote
---      (this is what keeps MM2's own animations out)
---   4. id is a known avatar emote id                  -> emote
---   5. anything else (engine-created, no parent)      -> emote, unless it is a
---      very short one-shot action
+-- When the emote ends, only parts that this feature changed from true -> false
+-- are restored.  The animation itself is never played/stopped/restarted here.
 -- ============================================================
 
--- true = print one line per new track (verdict + reason) and when protection
--- turns on/off. Use it to confirm a Roblox emote is caught and an MM2 emote
--- is not.
-local DEBUG=false
+local Players=game:GetService("Players")
+local RunService=game:GetService("RunService")
+local LocalPlayer=player
 
-local GRACE=0.3                   -- seconds protection bridges a track hand-off
-local WATCHDOG=0.25               -- seconds between safety re-scans
-local TREAT_UNKNOWN_AS_EMOTE=true -- rule 5 above
-local MIN_UNKNOWN_LENGTH=0.6      -- unknown one-shots shorter than this are ignored
+local WATCHDOG=0.10
+local TRACK_GRACE=0.35
 
--- Classic Animate emote animations (R15 then R6). Avatar-wheel emotes are NOT
--- listed by id here: they are recognised structurally (rule 5) and, where the
--- ids happen to match, through HumanoidDescription:GetEmotes().
 local CLASSIC_EMOTE_IDS={
-    [507770239]=true,[507770453]=true,[507771019]=true,[507776043]=true,
-    [507777268]=true,[507770818]=true,[507770677]=true,
-    [128777973]=true,[128853357]=true,[182435998]=true,[182491037]=true,
-    [182491065]=true,[129423131]=true,[129423030]=true,
+    -- R15 classic emotes
+    [507770239]=true, -- wave
+    [507770453]=true, -- point
+    [507771019]=true, -- dance
+    [507776043]=true, -- dance2
+    [507777268]=true, -- dance3
+    [507770818]=true, -- laugh
+    [507770677]=true, -- cheer
+
+    -- R6 classic emotes
+    [128777973]=true, -- wave
+    [128853357]=true, -- point
+    [182435998]=true, -- dance
+    [182491037]=true, -- dance2
+    [182491065]=true, -- dance3
+    [129423131]=true, -- laugh
+    [129423030]=true, -- cheer
 }
 
--- Backup list of default locomotion/pose animations (R15 then R6). The live
--- Animate script and HumanoidDescription are scanned too and are authoritative;
--- this only matters when something plays a default animation by raw id.
-local LOCOMOTION_IDS={
-    [507766666]=true,[507766951]=true,[507766388]=true,[507777826]=true,
-    [507767714]=true,[507765000]=true,[507767968]=true,[507765644]=true,
-    [507784897]=true,[507785072]=true,[2506281703]=true,[507768375]=true,
-    [522635514]=true,[522638767]=true,
-    [180435571]=true,[180435792]=true,[180426354]=true,[125750702]=true,
-    [180436148]=true,[180436334]=true,[178130996]=true,[182393478]=true,
-    [129967390]=true,[129967478]=true,
-}
+local emoteIds={}
+local activeTracks=setmetatable({}, {__mode="k"})
+local changedParts=setmetatable({}, {__mode="k"})
+local setupConnections={}
+local protectionConnections={}
+local steppedConnection=nil
 
--- Put animation ids here to force "never an emote" (e.g. an MM2 emote that the
--- DEBUG output shows being treated as one).
-local EXCLUDED_ANIMATION_IDS={}
+local boundCharacter=nil
+local boundHumanoid=nil
+local boundAnimator=nil
+local animatorPlayedConnection=nil
+local applyDescriptionConnection=nil
 
-local EMOTE_GROUPS={
-    wave=true,point=true,dance=true,dance2=true,dance3=true,laugh=true,cheer=true,
-}
-
-local LOCOMOTION_PROPS={
-    "ClimbAnimation","FallAnimation","IdleAnimation","JumpAnimation",
-    "RunAnimation","SwimAnimation","WalkAnimation",
-}
-
-local emoteIds,locomotionIds=CLASSIC_EMOTE_IDS,LOCOMOTION_IDS
-local active=setmetatable({}, {__mode="k"})   -- track -> true while an emote track is live
-local verdicts=setmetatable({}, {__mode="k"})  -- track -> cached classification
-local stoppedConns={}                          -- track -> Stopped connection
-local changed=setmetatable({}, {__mode="k"})   -- part -> true (it was collidable before we cleared it)
-local charConns,humanoidConns,animatorConns={}, {}, {}
-local stepConn=nil
+local protectionActive=false
 local graceUntil=0
 local session=0
-local boundChar,boundHumanoid,boundAnimator=nil,nil,nil
-local resolveBindings
 
-local function dprint(...)
-    if DEBUG then print("[VisualsV2 emote]",...) end
+local function disconnectConnection(conn)
+    if conn then
+        pcall(function() conn:Disconnect() end)
+    end
 end
 
-local function numericId(value)
+local function disconnectList(list)
+    for i=#list,1,-1 do
+        disconnectConnection(list[i])
+        list[i]=nil
+    end
+end
+
+local function numericAnimationId(value)
     if type(value)=="number" then
-        if value>0 then return value end
-        return nil
+        return value>0 and value or nil
     end
     if type(value)~="string" then return nil end
     return tonumber(value:match("%d+"))
 end
 
-local function addId(set,value)
-    local id=numericId(value)
-    if id then set[id]=true end
-end
-
-local function disconnectAll(list)
-    for i=#list,1,-1 do
-        local conn=list[i]
-        list[i]=nil
-        pcall(function() conn:Disconnect() end)
+local function addEmoteId(value)
+    local id=numericAnimationId(value)
+    if id then
+        emoteIds[id]=true
     end
 end
 
--- Name (lower-case) of the direct child of the character's Animate-style
--- script that contains this animation, or nil if it is not inside one.
-local function animateGroupName(animation,char)
-    if not char or not animation:IsDescendantOf(char) then return nil end
-    local node=animation
-    while node.Parent and node.Parent~=char do
-        if node.Parent:IsA("LuaSourceContainer") then
-            return node.Name:lower()
-        end
-        node=node.Parent
-    end
-    return nil
-end
+local function readDescriptionEmotes(description)
+    if not description then return end
 
-local function isEmoteGroup(name)
-    if EMOTE_GROUPS[name] then return true end
-    return name:find("emote",1,true)~=nil
-end
-
--- Tool animations and anything parented inside the game belong to the game
--- (knife/gun animations, MM2's own emote system, other scripts).
-local function isGameOwned(animation,char)
-    if animation:FindFirstAncestorOfClass("Tool") then return true end
-    if char and animation:IsDescendantOf(char) then return false end
-    return animation:IsDescendantOf(game)
-end
-
--- Rebuilds the id sets from the live Animate script and HumanoidDescription.
--- May yield, so it is only ever called from its own thread.
-local function refreshCatalog(char,humanoid)
-    local emotes,moves={}, {}
-    for id in pairs(CLASSIC_EMOTE_IDS) do emotes[id]=true end
-    for id in pairs(LOCOMOTION_IDS) do moves[id]=true end
-
-    if char then
-        for _,child in ipairs(char:GetChildren()) do
-            if child:IsA("LuaSourceContainer") then
-                for _,animation in ipairs(child:GetDescendants()) do
-                    if animation:IsA("Animation") then
-                        local id=numericId(animation.AnimationId)
-                        local group=animateGroupName(animation,char)
-                        if id and group then
-                            if isEmoteGroup(group) then
-                                emotes[id]=true
-                            else
-                                moves[id]=true
-                            end
-                        end
-                    end
+    local okEmotes,dictionary=pcall(function()
+        return description:GetEmotes()
+    end)
+    if okEmotes and type(dictionary)=="table" then
+        for _,value in pairs(dictionary) do
+            if type(value)=="table" then
+                for _,assetId in pairs(value) do
+                    addEmoteId(assetId)
                 end
+            else
+                addEmoteId(value)
             end
         end
+    end
+end
+
+local function refreshEmoteCatalog(humanoid,mySession)
+    table.clear(emoteIds)
+    for id in pairs(CLASSIC_EMOTE_IDS) do
+        emoteIds[id]=true
     end
 
     if humanoid then
-        local okDescription,description=pcall(function()
+        local okApplied,description=pcall(function()
             return humanoid:GetAppliedDescription()
         end)
-        if okDescription and description then
-            for _,prop in ipairs(LOCOMOTION_PROPS) do
-                local okProp,value=pcall(function() return description[prop] end)
-                if okProp then addId(moves,value) end
-            end
-            local okEmotes,dictionary=pcall(function()
-                return description:GetEmotes()
+        if okApplied and description then
+            readDescriptionEmotes(description)
+            pcall(function() description:Destroy() end)
+        end
+    end
+
+    -- Forced-body systems can replace the live HumanoidDescription and leave
+    -- its emote table incomplete.  Read the account avatar description too.
+    task.spawn(function()
+        local okAccount,description=pcall(function()
+            local okAsync,asyncDescription=pcall(function()
+                return Players:GetHumanoidDescriptionFromUserIdAsync(LocalPlayer.UserId)
             end)
-            if okEmotes and type(dictionary)=="table" then
-                for _,ids in pairs(dictionary) do
-                    if type(ids)=="table" then
-                        for _,id in ipairs(ids) do addId(emotes,id) end
-                    end
-                end
+            if okAsync and asyncDescription then
+                return asyncDescription
             end
+            return Players:GetHumanoidDescriptionFromUserId(LocalPlayer.UserId)
+        end)
+
+        if mySession~=session then
+            if okAccount and description then
+                pcall(function() description:Destroy() end)
+            end
+            return
         end
-    end
 
-    -- an id the game's own Animate treats as locomotion can never be an emote
-    for id in pairs(moves) do emotes[id]=nil end
-    emoteIds,locomotionIds=emotes,moves
-end
-
--- Returns isEmote, reason.
-local function judgeTrack(track,char)
-    local animation=track.Animation
-    if not animation then return false,"track has no Animation" end
-
-    local id=numericId(animation.AnimationId)
-    if id and EXCLUDED_ANIMATION_IDS[id] then return false,"excluded id" end
-    if id and locomotionIds[id] then return false,"locomotion id" end
-
-    local group=animateGroupName(animation,char)
-    if group then
-        if isEmoteGroup(group) then return true,"Animate emote group '"..group.."'" end
-        return false,"Animate group '"..group.."'"
-    end
-
-    if isGameOwned(animation,char) then return false,"game-owned animation" end
-    if id and emoteIds[id] then return true,"known avatar emote id" end
-    if not TREAT_UNKNOWN_AS_EMOTE then return false,"unknown animation" end
-
-    if not track.Looped then
-        local length=track.Length
-        if length>0 and length<MIN_UNKNOWN_LENGTH then
-            return false,"short one-shot action"
+        if okAccount and description then
+            readDescriptionEmotes(description)
+            pcall(function() description:Destroy() end)
         end
+    end)
+end
+
+local function trackAnimationId(track)
+    if not track then return nil end
+    local ok,animation=pcall(function() return track.Animation end)
+    if not ok or not animation then return nil end
+
+    local okId,value=pcall(function() return animation.AnimationId end)
+    if not okId then return nil end
+    return numericAnimationId(value)
+end
+
+local function isAvatarEmoteTrack(track)
+    local id=trackAnimationId(track)
+    return id~=nil and emoteIds[id]==true
+end
+
+local function isTrackPlaying(track)
+    local ok,value=pcall(function() return track.IsPlaying end)
+    return ok and value==true
+end
+
+-- This is the supplied no-collision template, wrapped so it only exists while
+-- a recognised Roblox avatar emote is active.
+local function disableCollision(instance)
+    if not instance or not instance:IsA("BasePart") then return end
+
+    if instance.CanCollide then
+        if changedParts[instance]==nil then
+            changedParts[instance]=true
+        end
+        instance.CanCollide=false
     end
-    return true,"unknown engine-created animation"
 end
 
-local function describeTrack(track)
-    local animation=track.Animation
-    local where="nil"
-    if animation and animation.Parent then where=animation:GetFullName() end
-    return string.format(
-        "track=%s anim=%s id=%s parent=%s priority=%s looped=%s length=%.2f",
-        tostring(track.Name),
-        animation and tostring(animation.Name) or "nil",
-        animation and tostring(animation.AnimationId) or "nil",
-        where,tostring(track.Priority),tostring(track.Looped),track.Length
-    )
-end
+local function setupProtectedCharacter(character)
+    if not character then return end
 
-local function readIsPlaying(track)
-    return track.IsPlaying
-end
-
-local function trackPlaying(track)
-    local ok,playing=pcall(readIsPlaying,track)
-    return ok and playing==true
-end
-
-local function dropTrack(track)
-    active[track]=nil
-    local conn=stoppedConns[track]
-    if conn then
-        stoppedConns[track]=nil
-        pcall(function() conn:Disconnect() end)
+    for _,instance in ipairs(character:GetDescendants()) do
+        disableCollision(instance)
     end
-    graceUntil=os.clock()+GRACE
+
+    table.insert(protectionConnections,character.DescendantAdded:Connect(function(instance)
+        if protectionActive then
+            disableCollision(instance)
+        end
+    end))
 end
 
-local function clearEmotes()
-    for track,conn in pairs(stoppedConns) do
-        stoppedConns[track]=nil
-        pcall(function() conn:Disconnect() end)
+local function setupProtectedPlayer(plr)
+    if plr.Character then
+        setupProtectedCharacter(plr.Character)
     end
-    table.clear(active)
-    graceUntil=0
+
+    table.insert(protectionConnections,plr.CharacterAdded:Connect(function(character)
+        if protectionActive then
+            setupProtectedCharacter(character)
+        end
+    end))
 end
 
--- True while any recognised emote track is playing (or just ended: GRACE
--- bridges multi-stage emotes that hand over from one track to the next).
-local function emoteActive()
-    for track in pairs(active) do
-        if trackPlaying(track) then return true end
-        dropTrack(track)
-    end
-    return os.clock()<graceUntil
-end
-
--- ATAOs True/IY Anti Fling step. Only parts that were collidable are touched
--- and remembered, so restoring never alters anything this feature didn't change.
-local function applyStep()
-    for _,other in ipairs(Players:GetPlayers()) do
-        if other~=player then
-            local character=other.Character
-            if character then
-                for _,part in ipairs(character:GetDescendants()) do
-                    if part:IsA("BasePart") and part.CanCollide then
-                        changed[part]=true
-                        part.CanCollide=false
-                    end
-                end
+local function enforceCollisionProtection()
+    for _,plr in ipairs(Players:GetPlayers()) do
+        local character=plr.Character
+        if character then
+            for _,instance in ipairs(character:GetDescendants()) do
+                disableCollision(instance)
             end
         end
     end
 end
 
-local function setCollidable(part)
-    part.CanCollide=true
-end
+local function startProtection()
+    if protectionActive then return end
+    protectionActive=true
+    changedParts=setmetatable({}, {__mode="k"})
 
-local function restoreCollisions()
-    local count=0
-    for part in pairs(changed) do
-        changed[part]=nil
-        count+=1
-        if part.Parent then pcall(setCollidable,part) end
+    for _,plr in ipairs(Players:GetPlayers()) do
+        setupProtectedPlayer(plr)
     end
-    return count
+
+    table.insert(protectionConnections,Players.PlayerAdded:Connect(function(plr)
+        if protectionActive then
+            setupProtectedPlayer(plr)
+        end
+    end))
+
+    enforceCollisionProtection()
+
+    steppedConnection=RunService.Stepped:Connect(function()
+        if protectionActive then
+            enforceCollisionProtection()
+        end
+    end)
 end
 
 local function stopProtection()
-    local wasRunning=stepConn~=nil
-    if stepConn then
-        local conn=stepConn
-        stepConn=nil
-        pcall(function() conn:Disconnect() end)
-    end
-    local restored=restoreCollisions()
-    if wasRunning or restored>0 then
-        dprint("anti-fling OFF, restored",restored,"parts")
-    end
-end
-
-local function onStepped()
-    if not noInterruptionEmote or not emoteActive() then
-        stopProtection()
+    if not protectionActive and not steppedConnection and #protectionConnections==0 then
         return
     end
-    applyStep()
-end
 
-local function ensureProtection()
-    if not noInterruptionEmote or stepConn then return end
-    stepConn=RunService.Stepped:Connect(onStepped)
-    dprint("anti-fling ON")
-    applyStep() -- no gap between the emote starting and the first Stepped
-end
+    protectionActive=false
+    disconnectConnection(steppedConnection)
+    steppedConnection=nil
+    disconnectList(protectionConnections)
 
-local function handleTrack(track)
-    if not noInterruptionEmote or not track or active[track] then return end
-
-    local verdict=verdicts[track]
-    if verdict==nil then
-        local ok,isEmote,reason=pcall(judgeTrack,track,boundChar)
-        if ok then
-            verdict=isEmote==true
-        else
-            verdict=false
-            reason=tostring(isEmote)
-        end
-        verdicts[track]=verdict
-        if DEBUG then
-            local okInfo,info=pcall(describeTrack,track)
-            dprint(verdict and "EMOTE" or "ignore","|",reason,"|",okInfo and info or "?")
+    -- Only restore parts that were collidable before this feature changed them.
+    for part in pairs(changedParts) do
+        if part and part.Parent then
+            pcall(function()
+                if part.CanCollide==false then
+                    part.CanCollide=true
+                end
+            end)
         end
     end
-    if not verdict then return end
-
-    active[track]=true
-    local okConn,conn=pcall(function()
-        return track.Stopped:Connect(function()
-            dropTrack(track)
-        end)
-    end)
-    if okConn and conn then stoppedConns[track]=conn end
-    ensureProtection()
+    changedParts=setmetatable({}, {__mode="k"})
 end
 
-local function scanPlaying(animator)
+local function clearActiveTracks()
+    activeTracks=setmetatable({}, {__mode="k"})
+    graceUntil=0
+end
+
+local function anyActiveEmote()
+    local found=false
+    for track in pairs(activeTracks) do
+        if isTrackPlaying(track) and isAvatarEmoteTrack(track) then
+            found=true
+        else
+            activeTracks[track]=nil
+        end
+    end
+    return found
+end
+
+local function noteTrack(track)
+    if not noInterruptionEmote or not track then return false end
+    if not isAvatarEmoteTrack(track) then return false end
+
+    activeTracks[track]=true
+    graceUntil=os.clock()+TRACK_GRACE
+    startProtection()
+    return true
+end
+
+local function scanPlayingTracks(animator)
+    if not animator then return false end
+
     local ok,tracks=pcall(function()
         return animator:GetPlayingAnimationTracks()
     end)
-    if ok and type(tracks)=="table" then
-        for _,track in ipairs(tracks) do handleTrack(track) end
+    if not ok or type(tracks)~="table" then
+        return anyActiveEmote()
     end
+
+    local sawEmote=false
+    local seen=setmetatable({}, {__mode="k"})
+
+    for _,track in ipairs(tracks) do
+        seen[track]=true
+        if isAvatarEmoteTrack(track) then
+            activeTracks[track]=true
+            sawEmote=true
+        end
+    end
+
+    for track in pairs(activeTracks) do
+        if not seen[track] and not isTrackPlaying(track) then
+            activeTracks[track]=nil
+        end
+    end
+
+    if sawEmote or anyActiveEmote() then
+        graceUntil=os.clock()+TRACK_GRACE
+        startProtection()
+        return true
+    end
+
+    return false
 end
 
-local function bindAnimator(animator)
-    disconnectAll(animatorConns)
+local function bindAnimator(animator,mySession)
+    if animator==boundAnimator then return end
+
+    disconnectConnection(animatorPlayedConnection)
+    animatorPlayedConnection=nil
     boundAnimator=animator
+
     if not animator then return end
-    pcall(function()
-        table.insert(animatorConns,animator.AnimationPlayed:Connect(handleTrack))
+
+    animatorPlayedConnection=animator.AnimationPlayed:Connect(function(track)
+        if mySession~=session or not noInterruptionEmote then return end
+        noteTrack(track)
     end)
-    scanPlaying(animator)
 end
 
-local function bindHumanoid(humanoid)
-    disconnectAll(humanoidConns)
-    bindAnimator(nil)
+local function bindHumanoid(humanoid,mySession)
+    if humanoid==boundHumanoid then return end
+
+    disconnectConnection(applyDescriptionConnection)
+    applyDescriptionConnection=nil
     boundHumanoid=humanoid
-    if not humanoid then return end
 
-    -- Independent fallback for engines/forced rigs that race the Animator hook.
+    if not humanoid then
+        bindAnimator(nil,mySession)
+        return
+    end
+
+    refreshEmoteCatalog(humanoid,mySession)
+
     pcall(function()
-        table.insert(humanoidConns,humanoid.AnimationPlayed:Connect(handleTrack))
+        applyDescriptionConnection=humanoid.ApplyDescriptionFinished:Connect(function()
+            if mySession~=session or not noInterruptionEmote then return end
+            refreshEmoteCatalog(humanoid,mySession)
+            task.defer(function()
+                local animator=humanoid:FindFirstChildOfClass("Animator")
+                bindAnimator(animator,mySession)
+            end)
+        end)
     end)
-    pcall(function()
-        table.insert(humanoidConns,humanoid.ChildAdded:Connect(function(child)
-            if child:IsA("Animator") and boundChar then
-                task.defer(resolveBindings,boundChar)
-            end
-        end))
-    end)
-    pcall(function()
-        table.insert(humanoidConns,humanoid.ApplyDescriptionFinished:Connect(function()
-            task.defer(refreshCatalog,boundChar,humanoid)
-        end))
-    end)
-    task.spawn(refreshCatalog,boundChar,humanoid)
+
+    bindAnimator(humanoid:FindFirstChildOfClass("Animator"),mySession)
 end
 
--- Re-resolves Humanoid and Animator from the live character and rebinds if
--- either was replaced (forced R6/R15 swaps, Animator rebuilds).
-resolveBindings=function(char)
-    if not char or boundChar~=char then return end
-    local humanoid=char:FindFirstChildOfClass("Humanoid")
+local function resolveBindings(character,mySession)
+    if mySession~=session or not character or character~=LocalPlayer.Character then return end
+
+    local humanoid=character:FindFirstChildOfClass("Humanoid")
     if humanoid~=boundHumanoid then
-        bindHumanoid(humanoid)
+        bindHumanoid(humanoid,mySession)
     end
-    local animator=nil
-    if humanoid then animator=humanoid:FindFirstChildOfClass("Animator") end
-    if animator~=boundAnimator then
-        bindAnimator(animator)
+
+    if humanoid then
+        local animator=humanoid:FindFirstChildOfClass("Animator")
+        if animator~=boundAnimator then
+            bindAnimator(animator,mySession)
+        end
     end
 end
 
 local function teardown()
     session+=1
-    disconnectAll(charConns)
-    disconnectAll(humanoidConns)
-    disconnectAll(animatorConns)
-    clearEmotes()
-    boundChar,boundHumanoid,boundAnimator=nil,nil,nil
+
+    disconnectConnection(animatorPlayedConnection)
+    animatorPlayedConnection=nil
+    disconnectConnection(applyDescriptionConnection)
+    applyDescriptionConnection=nil
+    disconnectList(setupConnections)
+
+    boundCharacter=nil
+    boundHumanoid=nil
+    boundAnimator=nil
+
+    clearActiveTracks()
     stopProtection()
 end
 
--- Never yields: all waiting happens in its own thread, so callers (such as
--- the respawn hook that also sets up jump circles) are not delayed.
-setupAutomaticEmoteProtection=function(char)
-    teardown()
-    if not noInterruptionEmote or not char then return end
+setupAutomaticEmoteProtection=function(character)
+    -- Reset only this feature.  Korblox, Headless and every other addon system
+    -- are intentionally left alone.
+    disconnectConnection(animatorPlayedConnection)
+    animatorPlayedConnection=nil
+    disconnectConnection(applyDescriptionConnection)
+    applyDescriptionConnection=nil
+    disconnectList(setupConnections)
+    clearActiveTracks()
+    stopProtection()
 
+    session+=1
     local mySession=session
-    boundChar=char
+    boundCharacter=character
+    boundHumanoid=nil
+    boundAnimator=nil
 
-    local function alive()
-        return noInterruptionEmote
-            and session==mySession
-            and boundChar==char
-            and char.Parent~=nil
-            and player.Character==char
-    end
+    if not noInterruptionEmote or not character then return end
 
-    pcall(function()
-        table.insert(charConns,player.CharacterRemoving:Connect(function(removing)
-            if removing==char and session==mySession then
-                clearEmotes()
-                stopProtection()
-            end
-        end))
-    end)
-    pcall(function()
-        table.insert(charConns,player.CharacterAppearanceLoaded:Connect(function(loaded)
-            if loaded==char and alive() then
-                task.spawn(refreshCatalog,char,boundHumanoid)
-            end
-        end))
-    end)
-    pcall(function()
-        table.insert(charConns,char.ChildAdded:Connect(function(child)
-            if not alive() then return end
-            if child:IsA("Humanoid") then
-                task.defer(resolveBindings,char)
-            elseif child:IsA("LuaSourceContainer") then
-                task.defer(refreshCatalog,char,boundHumanoid)
-            end
-        end))
+    resolveBindings(character,mySession)
+
+    table.insert(setupConnections,character.ChildAdded:Connect(function(child)
+        if mySession~=session or not noInterruptionEmote then return end
+        if child:IsA("Humanoid") then
+            task.defer(resolveBindings,character,mySession)
+        end
+    end))
+
+    table.insert(setupConnections,character.DescendantAdded:Connect(function(descendant)
+        if mySession~=session or not noInterruptionEmote then return end
+        if descendant:IsA("Animator") then
+            task.defer(resolveBindings,character,mySession)
+        end
+    end))
+
+    -- Re-read once after the forced body/Animate setup has had time to settle.
+    task.delay(1,function()
+        if mySession==session and noInterruptionEmote and LocalPlayer.Character==character then
+            resolveBindings(character,mySession)
+            refreshEmoteCatalog(boundHumanoid,mySession)
+        end
     end)
 
     task.spawn(function()
-        while alive() do
-            resolveBindings(char)
-            if boundAnimator then scanPlaying(boundAnimator) end
-            if not stepConn and emoteActive() then ensureProtection() end
+        while mySession==session and noInterruptionEmote
+            and LocalPlayer.Character==character and character.Parent do
+
+            resolveBindings(character,mySession)
+
+            local activeNow=scanPlayingTracks(boundAnimator)
+            if not activeNow and protectionActive and os.clock()>=graceUntil then
+                stopProtection()
+            end
+
             task.wait(WATCHDOG)
         end
-        if session==mySession then
-            clearEmotes()
+
+        if mySession==session then
+            clearActiveTracks()
             stopProtection()
         end
     end)
@@ -2454,16 +2441,16 @@ local noInterruptionToggle=addToggle(
         SetCfg("noInterruptionEmote",state)
 
         if state then
-            setupAutomaticEmoteProtection(player.Character)
+            setupAutomaticEmoteProtection(LocalPlayer.Character)
         else
             teardown()
         end
     end
 )
 
-if noInterruptionEmote and player.Character then
+if noInterruptionEmote and LocalPlayer.Character then
     task.defer(function()
-        setupAutomaticEmoteProtection(player.Character)
+        setupAutomaticEmoteProtection(LocalPlayer.Character)
     end)
 end
 
@@ -2480,7 +2467,6 @@ env.VisualsV2Runtime.RegisterReset(function()
     teardown()
 end)
 end)()
-
 
 -- =========================================================
 -- UTILITIES: SPEED GLITCH
@@ -2958,256 +2944,6 @@ env.VisualsV2Runtime.RegisterReset(function()
     BindableButtons:SetLocked("VisualsV2_SpeedBind",false)
     updateSpeedButtonStyle()
 end)
-
--- =========================================================
--- UTILITIES: ANTI-AIM EXTENSION
--- =========================================================
-
-;(function()
-local shared = odh_shared_plugins
-
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-
-local LocalPlayer = Players.LocalPlayer
-
-local userWantsEnabled = false
-local enabled = false
-local velocityConnection = nil
-local hadKnifeLastFrame = false
-
-local ignoreListEnabled = true
-local slot1Player = nil
-local slot2Player = nil
-local slot3Player = nil
-
-local aaSection = mainTab:AddSection("Anti-Aim Extension", "Utilities")
-
-local function getPlayerList()
-    local list = {"None"}
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer then
-            table.insert(list, p.Name)
-        end
-    end
-    return list
-end
-
-local function findPlayerByName(name)
-    if not name or name == "None" then return nil end
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p.Name == name then
-            return p
-        end
-    end
-    return nil
-end
-
-local function hasKnife()
-    local backpack = LocalPlayer:FindFirstChild("Backpack")
-    local character = LocalPlayer.Character
-    if backpack and backpack:FindFirstChild("Knife") then
-        return true
-    end
-    if character and character:FindFirstChild("Knife") then
-        return true
-    end
-    return false
-end
-
-local function isPlayerNearby(hrp)
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
-            local otherHrp = player.Character.HumanoidRootPart
-            if (otherHrp.Position - hrp.Position).Magnitude <= 6 then
-                return true
-            end
-        end
-    end
-    return false
-end
-
-local function isInWater(humanoid)
-    local state = humanoid:GetState()
-    return state == Enum.HumanoidStateType.Swimming or humanoid.FloorMaterial == Enum.Material.Water
-end
-
-local function isIgnoredPlayerArmed()
-    if not ignoreListEnabled then
-        return false
-    end
-
-    local targets = {slot1Player, slot2Player, slot3Player}
-    for _, player in ipairs(targets) do
-        if player and player.Parent then
-            local backpack = player:FindFirstChild("Backpack")
-            local character = player.Character
-            
-            if backpack then
-                for _, item in ipairs(backpack:GetChildren()) do
-                    if item:IsA("Tool") then
-                        return true
-                    end
-                end
-            end
-            
-            if character then
-                for _, item in ipairs(character:GetChildren()) do
-                    if item:IsA("Tool") then
-                        return true
-                    end
-                end
-            end
-        end
-    end
-    return false
-end
-
-local function performRoleStep(humanoid)
-    task.spawn(function()
-        local randomX = math.random() > 0.5 and 1 or -1
-        local randomZ = math.random() > 0.5 and 1 or -1
-        local moveDir = Vector3.new(randomX, 0, randomZ).Unit
-
-        local startTime = tick()
-        while tick() - startTime < 0.15 do
-            if humanoid and humanoid.Parent then
-                humanoid:Move(moveDir, false)
-            end
-            RunService.RenderStepped:Wait()
-        end
-    end)
-end
-
-local function stopAntiAim()
-    if velocityConnection then
-        velocityConnection:Disconnect()
-        velocityConnection = nil
-    end
-end
-
-local function startAntiAim()
-    if velocityConnection then return end
-    velocityConnection = RunService.Heartbeat:Connect(function()
-        if isIgnoredPlayerArmed() then
-            if enabled then
-                enabled = false
-            end
-            return
-        else
-            if userWantsEnabled and not enabled then
-                enabled = true
-            end
-        end
-
-        local character = LocalPlayer.Character
-        if character and character:FindFirstChild("HumanoidRootPart") and character:FindFirstChild("Humanoid") then
-            local humanoid = character.Humanoid
-            if humanoid.Health > 0 then
-                local hrp = character.HumanoidRootPart
-                local currentlyHasKnife = hasKnife()
-
-                if currentlyHasKnife and not hadKnifeLastFrame then
-                    performRoleStep(humanoid)
-                end
-                hadKnifeLastFrame = currentlyHasKnife
-
-                if currentlyHasKnife and not isPlayerNearby(hrp) and not isInWater(humanoid) then
-                    local oldVelocity = hrp.AssemblyLinearVelocity
-                    local state = humanoid:GetState()
-                    local isJumping = (state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall)
-                    local isStopped = (humanoid.MoveDirection.Magnitude == 0)
-
-                    local multiplier = math.random(1, 2) == 1 and 320 or -320
-                    
-                    if isJumping then
-                        local jumpMultY = math.random(1, 2) == 1 and 250 or -250
-                        hrp.AssemblyLinearVelocity = Vector3.new(multiplier, jumpMultY, multiplier)
-                    elseif isStopped then
-                        local stopMult = math.random(1, 2) == 1 and 400 or -400
-                        hrp.AssemblyLinearVelocity = Vector3.new(stopMult, 0, stopMult)
-                    else
-                        hrp.AssemblyLinearVelocity = Vector3.new(multiplier, 0, multiplier)
-                    end
-                    
-                    RunService.RenderStepped:Wait()
-                    hrp.AssemblyLinearVelocity = oldVelocity
-                end
-            end
-        else
-            hadKnifeLastFrame = false
-        end
-    end)
-end
-
-aaSection:AddToggle("Enable Anti-Aim", function(bool)
-    userWantsEnabled = bool
-    enabled = bool
-    if bool then
-        startAntiAim()
-        shared.Notify("Anti-Aim Enabled", 2)
-    else
-        stopAntiAim()
-        shared.Notify("Anti-Aim Disabled", 2)
-    end
-end)
-
-aaSection:AddToggle("Enable Ignore List", function(bool)
-    ignoreListEnabled = bool
-    if bool then
-        shared.Notify("Ignore List Enabled", 2)
-    else
-        shared.Notify("Ignore List Disabled", 2)
-    end
-end)
-
-local drop1, drop2, drop3
-
-local function updateDropdowns()
-    local list = getPlayerList()
-    if drop1 then drop1.Change(list) end
-    if drop2 then drop2.Change(list) end
-    if drop3 then drop3.Change(list) end
-end
-
-drop1 = aaSection:AddDropdown("Ignore Player 1", getPlayerList(), function(selected)
-    slot1Player = findPlayerByName(selected)
-    if slot1Player then
-        shared.Notify("Slot 1: " .. slot1Player.Name, 2)
-    else
-        shared.Notify("Slot 1: None", 2)
-    end
-end)
-
-drop2 = aaSection:AddDropdown("Ignore Player 2", getPlayerList(), function(selected)
-    slot2Player = findPlayerByName(selected)
-    if slot2Player then
-        shared.Notify("Slot 2: " .. slot2Player.Name, 2)
-    else
-        shared.Notify("Slot 2: None", 2)
-    end
-end)
-
-drop3 = aaSection:AddDropdown("Ignore Player 3", getPlayerList(), function(selected)
-    slot3Player = findPlayerByName(selected)
-    if slot3Player then
-        shared.Notify("Slot 3: " .. slot3Player.Name, 2)
-    else
-        shared.Notify("Slot 3: None", 2)
-    end
-end)
-
-Players.PlayerAdded:Connect(function()
-    updateDropdowns()
-end)
-
-Players.PlayerRemoving:Connect(function(player)
-    if slot1Player == player then slot1Player = nil end
-    if slot2Player == player then slot2Player = nil end
-    if slot3Player == player then slot3Player = nil end
-    updateDropdowns()
-end)
-end)()
 
 -- =========================================================
 -- UTILITIES: DISTANCE ESP ONLY
@@ -4291,12 +4027,19 @@ end)()
 local section=mainTab:AddSection("Coin Aura","Utilities")
 local enabled=C("coinAuraEnabled",false)
 local radius=math.clamp(tonumber(C("coinAuraRadius",8)) or 8,1,8)
-local scanToken=0
-local workspaceConn=nil
-local watchedContainers=setmetatable({}, {__mode="k"})
-local containerConnections={}
+
+-- Keep a live cache instead of rebuilding/scanning CoinContainer every frame.
+-- The actual distance check runs at 12.5 Hz, which is fast enough for an
+-- 8-stud aura but substantially cheaper than doing the same work every frame.
+local heartbeatConn=nil
+local workspaceAddedConn=nil
+local containerConnections=setmetatable({}, {__mode="k"})
 local coinParts=setmetatable({}, {__mode="k"})
 local lastTouch=setmetatable({}, {__mode="k"})
+local accumulator=0
+
+local CHECK_INTERVAL=0.08
+local TOUCH_RETRY_INTERVAL=0.30
 
 local function hasFireTouchInterest()
     return type(firetouchinterest)=="function"
@@ -4309,17 +4052,17 @@ local function fireTouch(a,b)
     return ok0 or ok1
 end
 
-local function isCoinTouchPart(obj)
-    return obj and obj:IsA("BasePart") and obj:FindFirstChild("TouchInterest")~=nil
+local function cacheCoinPart(part)
+    if not part or not part:IsA("BasePart") then return end
+    if part:FindFirstChild("TouchInterest") then
+        coinParts[part]=true
+    end
 end
 
-local function addCoinPart(obj)
-    if isCoinTouchPart(obj) then
-        coinParts[obj]=true
-        return
-    end
-    -- TouchInterest can be inserted after the coin BasePart itself.
-    if obj and obj.Name=="TouchInterest" then
+local function inspectContainerDescendant(obj)
+    if obj:IsA("BasePart") then
+        cacheCoinPart(obj)
+    elseif obj.Name=="TouchInterest" then
         local parent=obj.Parent
         if parent and parent:IsA("BasePart") then
             coinParts[parent]=true
@@ -4327,34 +4070,47 @@ local function addCoinPart(obj)
     end
 end
 
-local function watchContainer(container)
-    if not container or watchedContainers[container] then return end
-    watchedContainers[container]=true
-
-    for _,obj in ipairs(container:GetDescendants()) do
-        addCoinPart(obj)
-    end
-
-    table.insert(containerConnections,container.DescendantAdded:Connect(function(obj)
-        if not enabled then return end
-        addCoinPart(obj)
-    end))
-    table.insert(containerConnections,container.DescendantRemoving:Connect(function(obj)
-        coinParts[obj]=nil
-        lastTouch[obj]=nil
-        if obj and obj.Name=="TouchInterest" then
-            local parent=obj.Parent
-            if parent and parent:IsA("BasePart") then
-                coinParts[parent]=nil
-                lastTouch[parent]=nil
-            end
+local function unwatchContainer(container)
+    local conns=containerConnections[container]
+    if conns then
+        for _,c in ipairs(conns) do
+            pcall(function() c:Disconnect() end)
         end
-    end))
+        containerConnections[container]=nil
+    end
 end
 
-local function discoverContainersOnce()
-    -- One initial discovery pass only. After this, new map/round containers are
-    -- picked up by Workspace.DescendantAdded instead of rescanning every frame.
+local function watchContainer(container)
+    if not container or containerConnections[container] then return end
+
+    -- Scan each CoinContainer once when it appears, then maintain the cache
+    -- from descendant events instead of calling GetDescendants every frame.
+    for _,obj in ipairs(container:GetDescendants()) do
+        inspectContainerDescendant(obj)
+    end
+
+    local conns={}
+    conns[#conns+1]=container.DescendantAdded:Connect(inspectContainerDescendant)
+    conns[#conns+1]=container.AncestryChanged:Connect(function()
+        if not container:IsDescendantOf(workspace) then
+            unwatchContainer(container)
+        end
+    end)
+    containerConnections[container]=conns
+end
+
+local function discoverContainers()
+    -- Normal MM2 layouts are found quickly here.
+    for _,child in ipairs(workspace:GetChildren()) do
+        if child.Name=="CoinContainer" then
+            watchContainer(child)
+        else
+            local nested=child:FindFirstChild("CoinContainer",true)
+            if nested then watchContainer(nested) end
+        end
+    end
+
+    -- One startup fallback for unusual/nested map layouts. This is not run per frame.
     for _,obj in ipairs(workspace:GetDescendants()) do
         if obj.Name=="CoinContainer" then
             watchContainer(obj)
@@ -4362,62 +4118,72 @@ local function discoverContainersOnce()
     end
 end
 
-local function cleanupWatchers()
-    scanToken+=1
-    if workspaceConn then workspaceConn:Disconnect(); workspaceConn=nil end
-    for _,conn in ipairs(containerConnections) do
-        pcall(function() conn:Disconnect() end)
+local function collectCachedCoins(dt)
+    if not enabled then return end
+
+    accumulator+=dt
+    if accumulator<CHECK_INTERVAL then return end
+    accumulator=0
+
+    local char=player.Character
+    local root=char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    local rootPos=root.Position
+    local radiusSq=radius*radius
+    local now=os.clock()
+
+    for part in pairs(coinParts) do
+        if not part or not part.Parent then
+            coinParts[part]=nil
+            lastTouch[part]=nil
+        else
+            local delta=rootPos-part.Position
+            local distanceSq=delta.X*delta.X + delta.Y*delta.Y + delta.Z*delta.Z
+
+            if distanceSq<=radiusSq then
+                local previous=lastTouch[part] or 0
+                if now-previous>=TOUCH_RETRY_INTERVAL then
+                    if fireTouch(root,part) then
+                        lastTouch[part]=now
+                    end
+                end
+            end
+        end
     end
-    table.clear(containerConnections)
-    watchedContainers=setmetatable({}, {__mode="k"})
-    coinParts=setmetatable({}, {__mode="k"})
-    lastTouch=setmetatable({}, {__mode="k"})
+end
+
+local function stopAura()
+    if heartbeatConn then
+        heartbeatConn:Disconnect()
+        heartbeatConn=nil
+    end
+    if workspaceAddedConn then
+        workspaceAddedConn:Disconnect()
+        workspaceAddedConn=nil
+    end
+    for container in pairs(containerConnections) do
+        unwatchContainer(container)
+    end
+    table.clear(coinParts)
+    table.clear(lastTouch)
+    accumulator=0
 end
 
 local function startAura()
-    cleanupWatchers()
+    stopAura()
     if not enabled then return end
 
-    discoverContainersOnce()
-    workspaceConn=workspace.DescendantAdded:Connect(function(obj)
-        if enabled and obj.Name=="CoinContainer" then
+    discoverContainers()
+
+    -- New rounds/maps can create a replacement CoinContainer.
+    workspaceAddedConn=workspace.DescendantAdded:Connect(function(obj)
+        if obj.Name=="CoinContainer" then
             watchContainer(obj)
         end
     end)
 
-    scanToken+=1
-    local myToken=scanToken
-    task.spawn(function()
-        -- 12.5 checks/sec is responsive for an 8-stud aura without doing a full
-        -- coin/map scan every rendered frame.
-        while enabled and myToken==scanToken do
-            local char=player.Character
-            local root=char and char:FindFirstChild("HumanoidRootPart")
-            if root then
-                local rootPos=root.Position
-                local radiusSq=radius*radius
-                local now=os.clock()
-
-                for part in pairs(coinParts) do
-                    if not part or not part.Parent then
-                        coinParts[part]=nil
-                        lastTouch[part]=nil
-                    else
-                        local delta=rootPos-part.Position
-                        local distSq=delta.X*delta.X+delta.Y*delta.Y+delta.Z*delta.Z
-                        if distSq<=radiusSq then
-                            local previous=lastTouch[part] or 0
-                            if now-previous>=0.30 then
-                                lastTouch[part]=now
-                                fireTouch(root,part)
-                            end
-                        end
-                    end
-                end
-            end
-            task.wait(0.08)
-        end
-    end)
+    heartbeatConn=RunService.Heartbeat:Connect(collectCachedCoins)
 end
 
 local toggle=addToggle(section,"VV2 Coin Aura",enabled,function(v)
@@ -4430,17 +4196,20 @@ local toggle=addToggle(section,"VV2 Coin Aura",enabled,function(v)
         end)
     end
 
-    if v then startAura() else cleanupWatchers() end
+    if v then startAura() else stopAura() end
 end)
+
 section:AddSlider("VV2 Coin Aura Radius",1,8,radius,function(v)
-    radius=math.clamp(tonumber(v) or 8,1,8)
-    SetCfg("coinAuraRadius",radius)
+    radius=v
+    SetCfg("coinAuraRadius",v)
 end)
+
 env.VisualsV2Runtime.RegisterReset(function()
     toggle:Set(false)
     enabled=false
-    cleanupWatchers()
+    stopAura()
 end)
+
 if enabled then task.defer(startAura) end
 end)()
 
@@ -4457,6 +4226,7 @@ if tonumber(ConfigData["fireflyTimerSize"])==5 then
     ConfigData["fireflyTimerSize"]=10
 end
 local timerLocked=C("fireflyTimerLocked",false)
+local timerColors=C("fireflyTimerColors",false)
 local COUNTDOWN=2.5
 local COOLDOWN=16
 local TRIGGER_POINT=0.23
@@ -4473,7 +4243,7 @@ if type(PositionData["fireflyTimerPosition"])=="table" then
     end
 end
 
-local gui,timerLabel,timerUIScale
+local gui,timerLabel
 local countdownConnection,cooldownConnection,blockConnection
 local watchConnections={}
 local hookedTools=setmetatable({}, {__mode="k"})
@@ -4484,6 +4254,11 @@ local cycleToken=0
 local cycleStartedAt=nil
 local countdownEndsAt=nil
 local cooldownEndsAt=nil
+
+local BLACK=Color3.new(0,0,0)
+local GREEN=Color3.fromRGB(0,255,0)
+local YELLOW=Color3.fromRGB(255,200,0)
+local RED=Color3.fromRGB(255,0,0)
 
 local function disconnect(conn)
     if conn then pcall(function() conn:Disconnect() end) end
@@ -4498,33 +4273,38 @@ local function clearTimerGuis()
     end
 end
 
-local function sizeSliderScale(value)
-    -- Slider 1 now equals the old size-2 minimum (0.50x). Slider 10 remains
-    -- 2.50x, with the removed 0.25x step redistributed gradually across 1-10.
-    local v=math.clamp(tonumber(value) or 1,1,10)
-    return 0.50+((v-1)/9)*2.00
+local function timerCountdownColor(remaining,total)
+    if not timerColors then return BLACK end
+    local ratio=math.clamp((tonumber(remaining) or 0)/math.max(tonumber(total) or 1,0.001),0,1)
+    if ratio>0.66 then return GREEN end
+    if ratio>0.33 then return YELLOW end
+    return RED
 end
 
-local function timerCountdownColor(remaining,total)
-    local ratio=math.clamp((tonumber(remaining) or 0)/math.max(tonumber(total) or 1,0.001),0,1)
-    if ratio>0.66 then return Color3.fromRGB(0,255,0) end
-    if ratio>0.33 then return Color3.fromRGB(255,200,0) end
-    return Color3.fromRGB(255,0,0)
+local function refreshTimerColor()
+    if not timerLabel then return end
+    if not timerColors then
+        timerLabel.TextColor3=BLACK
+        return
+    end
+
+    local now=os.clock()
+    if countdownEndsAt and now<countdownEndsAt then
+        timerLabel.TextColor3=timerCountdownColor(countdownEndsAt-now,COUNTDOWN)
+    elseif cooldownEndsAt and now<cooldownEndsAt then
+        timerLabel.TextColor3=timerCountdownColor(cooldownEndsAt-now,COOLDOWN)
+    else
+        -- Ready/Active state is green when timer colors are enabled.
+        timerLabel.TextColor3=GREEN
+    end
 end
 
 local function applyTimerSize()
     if not timerLabel then return end
-    if not timerUIScale or not timerUIScale.Parent then
-        timerUIScale=timerLabel:FindFirstChild("VisualsV2_TimerScale")
-        if not timerUIScale then
-            timerUIScale=Instance.new("UIScale")
-            timerUIScale.Name="VisualsV2_TimerScale"
-            timerUIScale.Parent=timerLabel
-        end
-    end
-    timerLabel.Size=UDim2.fromOffset(96,32)
-    timerLabel.TextScaled=true
-    timerUIScale.Scale=sizeSliderScale(timerSize)
+    local width=72+((timerSize-1)*8)
+    local height=24+((timerSize-1)*2)
+    timerLabel.Size=UDim2.fromOffset(width,height)
+    timerLabel.TextSize=math.max(12,math.floor(height*0.65))
 end
 
 local function buildTimer()
@@ -4543,17 +4323,15 @@ local function buildTimer()
     timerLabel.Position=loadStoredPosition("fireflyTimerPosition",DEFAULT_POS)
     timerLabel.BackgroundTransparency=1
     timerLabel.BorderSizePixel=0
-    timerLabel.TextColor3=Color3.new(0,0,0)
+    timerLabel.TextColor3=BLACK
     timerLabel.TextStrokeTransparency=1
     timerLabel.Font=Enum.Font.GothamBold
     timerLabel.Text=""
     timerLabel.Visible=false
     timerLabel.Active=true
     timerLabel.Parent=gui
-    timerUIScale=Instance.new("UIScale")
-    timerUIScale.Name="VisualsV2_TimerScale"
-    timerUIScale.Parent=timerLabel
     applyTimerSize()
+    refreshTimerColor()
 
     local dragging=false
     local moved=false
@@ -4589,8 +4367,6 @@ local function fireJump()
     local humanoid=char and char:FindFirstChildOfClass("Humanoid")
     if not humanoid or humanoid.Health<=0 then return end
 
-    -- Match the Debug addon: force the jump state directly. This is important
-    -- for the second jump because FloorMaterial can already be Air.
     humanoid.Jump=true
     pcall(function()
         humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
@@ -4598,8 +4374,6 @@ local function fireJump()
 end
 
 local function startTwoJumpSequence(myCycle)
-    -- Debug addon behavior: first jump near the end of the 2.5s countdown,
-    -- then a second jump 0.40 seconds later.
     fireJump()
     task.delay(0.40,function()
         if autoClutch and myCycle==cycleToken then
@@ -4621,11 +4395,13 @@ local function stopCycle()
     cycleStartedAt=nil
     countdownEndsAt=nil
     cooldownEndsAt=nil
-    if timerLabel then timerLabel.Visible=false; timerLabel.Text=""; timerLabel.TextColor3=Color3.new(0,0,0) end
+    if timerLabel then
+        timerLabel.Visible=false
+        timerLabel.Text=""
+        timerLabel.TextColor3=BLACK
+    end
 end
 
--- Same activation/cooldown/jump behavior as the attached FFC addon. The only
--- change is that both original timer panels are rendered in one transparent label.
 local function startCountdown()
     if not autoClutch then return end
     buildTimer()
@@ -4662,9 +4438,13 @@ local function startCooldownPanel()
         local remaining=cooldownEndsAt-now
         if remaining<=0 then
             timerLabel.Text="Active"
-            timerLabel.TextColor3=Color3.new(0,0,0)
+            timerLabel.TextColor3=timerColors and GREEN or BLACK
             task.delay(0.6,function()
-                if timerLabel and not isOnCooldown then timerLabel.Visible=false; timerLabel.Text="" end
+                if timerLabel and not isOnCooldown then
+                    timerLabel.Visible=false
+                    timerLabel.Text=""
+                    timerLabel.TextColor3=BLACK
+                end
             end)
             disconnect(cooldownConnection)
             cooldownConnection=nil
@@ -4736,7 +4516,6 @@ local function hookTool()
         pcall(scanForFireflies)
         table.insert(watchConnections,container.ChildAdded:Connect(function(child)
             if child:IsA("Tool") and child.Name=="Fireflies" then
-                -- Hook immediately so the first use after execution is not missed.
                 connectToTool(child)
             end
         end))
@@ -4765,7 +4544,6 @@ local function hookTool()
     scanForFireflies()
 
     task.spawn(function()
-        -- Fast startup window for tools inserted while the addon is loading.
         for _=1,12 do
             if not autoClutch or myScan~=scanToken then return end
             pcall(scanForFireflies)
@@ -4804,7 +4582,7 @@ local function unhookTool()
     if timerLabel then
         timerLabel.Visible=false
         timerLabel.Text=""
-        timerLabel.TextColor3=Color3.new(0,0,0)
+        timerLabel.TextColor3=BLACK
     end
 end
 
@@ -4814,12 +4592,17 @@ local autoToggle=addToggle(section,"Auto Firefly Clutch",autoClutch,function(sta
     if state then
         buildTimer()
         unhookTool()
-        -- unhookTool clears stale tool hooks; restore the desired state and scan.
         autoClutch=true
         hookTool()
     else
         unhookTool()
     end
+end)
+
+local fireflyColorToggle=addToggle(section,"Enable Firefly Timer Colors",timerColors,function(state)
+    timerColors=state
+    SetCfg("fireflyTimerColors",state)
+    refreshTimerColor()
 end)
 
 section:AddSlider("Firefly Timer Size",1,10,timerSize,function(value)
@@ -4835,11 +4618,13 @@ end)
 
 env.VisualsV2Runtime.RegisterReset(function()
     autoToggle:Set(false)
+    fireflyColorToggle:Set(false)
     fireflyLockToggle:Set(false)
     autoClutch=false
+    timerColors=false
     timerLocked=false
     unhookTool()
-    if gui then gui:Destroy(); gui=nil; timerLabel=nil; timerUIScale=nil end
+    if gui then gui:Destroy(); gui=nil; timerLabel=nil end
 end)
 
 buildTimer()
@@ -5234,7 +5019,7 @@ end)()
 local section=mainTab:AddSection("Inventory Unlimiter","Utilities")
 section:AddParagraph(
     "Inventory Unlimiter",
-    "Raises the local inventory display/equip limit from 3 to 10. The target functions are cached after discovery to reduce repeated scanning."
+    "Raises the local inventory display/equip limit and reliably spawns the selected toy slots."
 )
 
 local inventoryEnabled=C("inventoryUnlimiterEnabled",false)
@@ -5252,70 +5037,186 @@ local setupvalue=(debug and debug.setupvalue) or setupvalue
 local getinfo=(debug and debug.getinfo) or getinfo
 local getconstants=(debug and debug.getconstants) or getconstants
 
-local targetFunctions={}
-local targetsScanned=false
-
-local function discoverTargets()
-    if targetsScanned then return end
-    targetsScanned=true
-    table.clear(targetFunctions)
-
-    if not (type(getgc)=="function" and type(getupvalues)=="function"
-        and type(setupvalue)=="function" and type(getinfo)=="function") then
-        return
+local defaultInventoryLimit=10
+pcall(function()
+    local deviceService=require(
+        game:GetService("ReplicatedStorage")
+            :WaitForChild("ClientServices",3)
+            :WaitForChild("DeviceService",3)
+    )
+    if deviceService and deviceService.IsMobileDevice and deviceService:IsMobileDevice() then
+        defaultInventoryLimit=3
     end
+end)
 
-    local okGc,objects=pcall(getgc)
-    if not okGc or type(objects)~="table" then return end
+local targetFunctions={}
+local targetSlots=setmetatable({}, {__mode="k"})
+local lastAppliedLimit=defaultInventoryLimit
+local lastScanAt=0
 
-    for _,f in ipairs(objects) do
-        if type(f)=="function" then
-            local success,info=pcall(getinfo,f)
-            if success and info then
-                local isTarget=(info.name=="updateItemFrame" or info.name=="onItemEquipped")
+local inventoryConnections={}
+local inventoryApplyToken=0
+local toyJobToken=0
 
-                if not isTarget and type(getconstants)=="function" then
-                    local cSuccess,constants=pcall(getconstants,f)
-                    if cSuccess and type(constants)=="table" then
-                        local hasTouch,hasEquip=false,false
-                        for _,c in ipairs(constants) do
-                            if c=="TouchBinding" then hasTouch=true
-                            elseif c=="EquipButton" then hasEquip=true end
-                            if hasTouch and hasEquip then break end
-                        end
-                        isTarget=hasTouch and hasEquip
-                    end
-                end
-
-                if isTarget then
-                    table.insert(targetFunctions,f)
-                end
-            end
-        end
+local function disconnectInventoryConnections()
+    for i=#inventoryConnections,1,-1 do
+        local conn=inventoryConnections[i]
+        inventoryConnections[i]=nil
+        pcall(function() conn:Disconnect() end)
     end
 end
 
-local function applyInventoryLimit()
-    if not inventoryEnabled then return end
-    discoverTargets()
-    if #targetFunctions==0 then return end
+local function functionLooksLikeTarget(f)
+    local okInfo,info=pcall(getinfo,f)
+    if not okInfo or not info then return false end
 
-    for _,f in ipairs(targetFunctions) do
-        local ok,upvalues=pcall(getupvalues,f)
-        if ok and type(upvalues)=="table" then
-            for idx,val in ipairs(upvalues) do
-                if type(val)=="number" and val>=2 and val<=10 then
-                    pcall(setupvalue,f,idx,inventoryLimit)
+    if info.name=="updateItemFrame" or info.name=="onItemEquipped" then
+        return true
+    end
+
+    if type(getconstants)=="function" then
+        local okConstants,constants=pcall(getconstants,f)
+        if okConstants and type(constants)=="table" then
+            local hasTouch,hasEquip=false,false
+            for _,constant in ipairs(constants) do
+                if constant=="TouchBinding" then hasTouch=true end
+                if constant=="EquipButton" then hasEquip=true end
+                if hasTouch and hasEquip then return true end
+            end
+        end
+    end
+
+    return false
+end
+
+local function findLimitSlots(f)
+    local ok,upvalues=pcall(getupvalues,f)
+    if not ok or type(upvalues)~="table" then return {} end
+
+    local preferred={}
+    local fallback={}
+
+    for index,value in ipairs(upvalues) do
+        if type(value)=="number" then
+            if value==3 or value==10 or value==lastAppliedLimit or value==inventoryLimit then
+                table.insert(preferred,index)
+            elseif value>=2 and value<=10 then
+                table.insert(fallback,index)
+            end
+        end
+    end
+
+    if #preferred>0 then return preferred end
+    return fallback
+end
+
+local function discoverTargets(force)
+    if type(getgc)~="function" or type(getupvalues)~="function"
+        or type(setupvalue)~="function" or type(getinfo)~="function" then
+        return 0
+    end
+
+    if not force and #targetFunctions>0 and (os.clock()-lastScanAt)<1 then
+        return #targetFunctions
+    end
+
+    lastScanAt=os.clock()
+    table.clear(targetFunctions)
+    targetSlots=setmetatable({}, {__mode="k"})
+
+    local okGc,objects=pcall(getgc)
+    if not okGc or type(objects)~="table" then return 0 end
+
+    local seen=setmetatable({}, {__mode="k"})
+    for _,object in ipairs(objects) do
+        if type(object)=="function" and not seen[object] then
+            seen[object]=true
+            if functionLooksLikeTarget(object) then
+                local slots=findLimitSlots(object)
+                if #slots>0 then
+                    table.insert(targetFunctions,object)
+                    targetSlots[object]=slots
                 end
             end
         end
+    end
+
+    return #targetFunctions
+end
+
+local function patchCachedTargets(targetLimit)
+    local patched=0
+
+    for i=#targetFunctions,1,-1 do
+        local f=targetFunctions[i]
+        local slots=targetSlots[f]
+        local functionPatched=false
+
+        if type(f)=="function" and type(slots)=="table" then
+            for _,index in ipairs(slots) do
+                local ok=pcall(setupvalue,f,index,targetLimit)
+                if ok then
+                    patched+=1
+                    functionPatched=true
+                end
+            end
+        end
+
+        if not functionPatched then
+            table.remove(targetFunctions,i)
+            targetSlots[f]=nil
+        end
+    end
+
+    if patched>0 then
+        lastAppliedLimit=targetLimit
+    end
+    return patched
+end
+
+local function applyLimitValue(targetLimit,forceRescan)
+    targetLimit=math.max(2,math.floor(tonumber(targetLimit) or defaultInventoryLimit))
+
+    if forceRescan or #targetFunctions==0 then
+        discoverTargets(true)
+    else
+        discoverTargets(false)
+    end
+
+    local patched=patchCachedTargets(targetLimit)
+
+    -- MM2 can replace the inventory closures while the addon is still loaded.
+    -- If the cached functions no longer patch anything, immediately rescan once.
+    if patched==0 and not forceRescan then
+        discoverTargets(true)
+        patched=patchCachedTargets(targetLimit)
+    end
+
+    return patched
+end
+
+local function applyInventoryLimit(forceRescan)
+    if not inventoryEnabled then return 0 end
+    return applyLimitValue(inventoryLimit,forceRescan)
+end
+
+local function scheduleInventoryApply()
+    inventoryApplyToken+=1
+    local token=inventoryApplyToken
+
+    local delays={0,0.35,1.0}
+    for _,delayTime in ipairs(delays) do
+        task.delay(delayTime,function()
+            if token~=inventoryApplyToken or not inventoryEnabled then return end
+            applyInventoryLimit(delayTime>0)
+        end)
     end
 end
 
 local function findToyFolder()
-    local bp=player:FindFirstChildOfClass("Backpack")
-    if not bp then return nil end
-    return bp:FindFirstChild("Toys")
+    local backpack=player:FindFirstChildOfClass("Backpack")
+    if not backpack then return nil end
+    return backpack:FindFirstChild("Toys")
 end
 
 local function getToyNames()
@@ -5328,6 +5229,7 @@ local function getToyNames()
             end
         end
     end
+
     table.sort(names,function(a,b)
         if a=="None" then return true end
         if b=="None" then return false end
@@ -5337,61 +5239,175 @@ local function getToyNames()
 end
 
 local function toyRemote()
-    local rs=game:GetService("ReplicatedStorage")
-    local remotes=rs:FindFirstChild("Remotes")
+    local replicatedStorage=game:GetService("ReplicatedStorage")
+    local remotes=replicatedStorage:FindFirstChild("Remotes")
     local extras=remotes and remotes:FindFirstChild("Extras")
     local remote=extras and extras:FindFirstChild("ReplicateToy")
     if remote and remote:IsA("RemoteFunction") then return remote end
     return nil
 end
 
+local function spawnedToy(name)
+    local character=player.Character
+    local backpack=player:FindFirstChildOfClass("Backpack")
+
+    if character then
+        local found=character:FindFirstChild(name)
+        if found then return found end
+    end
+
+    if backpack then
+        local found=backpack:FindFirstChild(name)
+        if found then return found end
+    end
+
+    return nil
+end
+
+local function desiredToyList()
+    local list={}
+    local seen={}
+
+    for slot=1,4 do
+        local selected=selectedToys[slot]
+        if selected and selected~="None" and not seen[selected] then
+            seen[selected]=true
+            table.insert(list,selected)
+        end
+    end
+
+    return list
+end
+
+local function waitForSpawnedToy(name,timeout,token)
+    local deadline=os.clock()+timeout
+    repeat
+        if token~=toyJobToken or not autoGetTools then return false end
+        if spawnedToy(name) then return true end
+        task.wait(0.05)
+    until os.clock()>=deadline
+
+    return spawnedToy(name)~=nil
+end
+
+local function requestToy(remote,name,token)
+    if spawnedToy(name) then return true end
+
+    for attempt=1,3 do
+        if token~=toyJobToken or not autoGetTools then return false end
+
+        -- Reassert the unlimiter immediately before every request.  This is
+        -- important when MM2 replaced the inventory UI/closures between toys.
+        if inventoryEnabled then
+            applyInventoryLimit(attempt>1)
+        end
+
+        pcall(function()
+            remote:InvokeServer(name)
+        end)
+
+        if waitForSpawnedToy(name,0.65,token) then
+            return true
+        end
+
+        task.wait(0.12)
+    end
+
+    return spawnedToy(name)~=nil
+end
+
+local function runToyJob(token)
+    local character=player.Character or player.CharacterAdded:Wait()
+    if token~=toyJobToken or not autoGetTools then return end
+    if character then character:WaitForChild("Humanoid",5) end
+
+    local deadline=os.clock()+5
+    while token==toyJobToken and autoGetTools
+        and not findToyFolder() and os.clock()<deadline do
+        task.wait(0.15)
+    end
+
+    if token~=toyJobToken or not autoGetTools then return end
+
+    local remote=nil
+    local remoteDeadline=os.clock()+5
+    repeat
+        remote=toyRemote()
+        if remote then break end
+        task.wait(0.15)
+    until token~=toyJobToken or not autoGetTools or os.clock()>=remoteDeadline
+
+    if token~=toyJobToken or not autoGetTools or not remote then return end
+
+    local desired=desiredToyList()
+    if #desired==0 then return end
+
+    if inventoryEnabled then
+        applyInventoryLimit(true)
+        task.wait(0.08)
+    end
+
+    for _,name in ipairs(desired) do
+        if token~=toyJobToken or not autoGetTools then return end
+        requestToy(remote,name,token)
+        task.wait(0.10)
+    end
+
+    -- One final rescan/reapply catches a closure that was rebuilt while the
+    -- fourth toy was being replicated.
+    if inventoryEnabled and token==toyJobToken then
+        applyInventoryLimit(true)
+        task.delay(0.35,function()
+            if token==toyJobToken and inventoryEnabled then
+                applyInventoryLimit(false)
+            end
+        end)
+    end
+end
+
 local function autoGetSelectedTools()
     if not autoGetTools then return end
-    task.spawn(function()
-        local char=player.Character or player.CharacterAdded:Wait()
-        if char then char:WaitForChild("Humanoid",5) end
 
-        local deadline=os.clock()+5
-        while not findToyFolder() and os.clock()<deadline do
-            task.wait(0.2)
-        end
+    -- Coalesce rapid dropdown changes.  Older jobs stop before continuing so
+    -- several four-toy batches cannot race each other.
+    toyJobToken+=1
+    local token=toyJobToken
 
-        local remote=toyRemote()
-        if not remote then return end
-
-        for slot=1,4 do
-            local selected=selectedToys[slot]
-            if selected and selected~="None" then
-                pcall(function()
-                    remote:InvokeServer(selected)
-                end)
-                task.wait(0.25)
-            end
-        end
+    task.delay(0.12,function()
+        if token~=toyJobToken or not autoGetTools then return end
+        runToyJob(token)
     end)
 end
 
 local inventoryToggle=addToggle(section,"Unlimit Inventory",inventoryEnabled,function(state)
     inventoryEnabled=state
     SetCfg("inventoryUnlimiterEnabled",state)
+
     if state then
-        -- A fresh scan is allowed each time it is manually re-enabled, but
-        -- repeated slider changes reuse the cached target functions.
-        targetsScanned=false
-        applyInventoryLimit()
+        scheduleInventoryApply()
+    else
+        inventoryApplyToken+=1
+        applyLimitValue(defaultInventoryLimit,true)
     end
 end)
 
 section:AddSlider("Max Items",3,10,inventoryLimit,function(value)
     inventoryLimit=math.clamp(math.floor(tonumber(value) or 10),3,10)
     SetCfg("inventoryMaxItems",inventoryLimit)
-    if inventoryEnabled then applyInventoryLimit() end
+
+    if inventoryEnabled then
+        applyInventoryLimit(false)
+    end
 end)
 
 local autoToggle=addToggle(section,"Auto Get Tools",autoGetTools,function(state)
     autoGetTools=state
     SetCfg("autoGetTools",state)
-    if state then autoGetSelectedTools() end
+
+    toyJobToken+=1
+    if state then
+        autoGetSelectedTools()
+    end
 end)
 
 local dropdowns={}
@@ -5406,7 +5422,7 @@ for slot=1,4 do
         function(selected)
             selectedToys[slot]=selected
             SetCfg("autoToySlot"..slot,selected)
-            if autoGetTools and selected~="None" then
+            if autoGetTools then
                 autoGetSelectedTools()
             end
         end
@@ -5424,29 +5440,47 @@ section:AddButton("Refresh Toy List",function()
     end
 end)
 
-player.CharacterAdded:Connect(function()
-    task.delay(0.8,function()
-        if inventoryEnabled then
-            -- Character replacement can replace MM2 UI closures.
-            targetsScanned=false
-            applyInventoryLimit()
-        end
-        if autoGetTools then
-            autoGetSelectedTools()
-        end
+table.insert(inventoryConnections,player.CharacterAdded:Connect(function()
+    inventoryApplyToken+=1
+    toyJobToken+=1
+
+    task.delay(0.30,function()
+        if inventoryEnabled then scheduleInventoryApply() end
+        if autoGetTools then autoGetSelectedTools() end
     end)
-end)
+end))
+
+local playerGui=player:FindFirstChildOfClass("PlayerGui")
+if playerGui then
+    local uiToken=0
+    table.insert(inventoryConnections,playerGui.ChildAdded:Connect(function()
+        if not inventoryEnabled then return end
+        uiToken+=1
+        local token=uiToken
+        task.delay(0.40,function()
+            if token==uiToken and inventoryEnabled then
+                applyInventoryLimit(true)
+            end
+        end)
+    end))
+end
 
 if inventoryEnabled then
-    task.defer(applyInventoryLimit)
+    task.defer(scheduleInventoryApply)
 end
 if autoGetTools then
     task.defer(autoGetSelectedTools)
 end
 
 env.VisualsV2Runtime.RegisterReset(function()
+    inventoryApplyToken+=1
+    toyJobToken+=1
+
     inventoryEnabled=false
     autoGetTools=false
+
+    applyLimitValue(defaultInventoryLimit,true)
+    disconnectInventoryConnections()
 end)
 end)()
 
@@ -5562,23 +5596,27 @@ saveConfig()
 local performanceTab=mainTab
 
 ;(function()
-local section=performanceTab:AddSection("FPS & Ping Monitor","Performance")
+local section=performanceTab:AddSection("FPS, Ping & Player Monitor","Performance")
 local Stats=game:GetService("Stats")
+
 local enabled=C("vv2FpsPingEnabled",false)
 local colors=C("vv2FpsPingColors",false)
-local pos=C("vv2FpsPingPosition","Top Right")
-local locked=C("vv2FpsPingLocked",false)
-local monitorSize=math.clamp(tonumber(C("vv2FpsPingSize",3)) or 3,1,10)
-local gui,holder,fps,ping,playerCount,uiScale,conn
+local locked=C("vv2MonitorLocked",false)
+local showFps=C("vv2MonitorShowFPS",true)
+local showPing=C("vv2MonitorShowPing",true)
+local showPlayers=C("vv2MonitorShowPlayers",true)
+
+-- This is the old "Top Center" preset. It is now only the reset/default
+-- position because the monitor itself is freely draggable.
+local DEFAULT_POS=UDim2.new(.44,0,0,15)
+local BLACK=Color3.new(0,0,0)
+local GREEN=Color3.fromRGB(0,255,0)
+local YELLOW=Color3.fromRGB(255,200,0)
+local RED=Color3.fromRGB(255,0,0)
+
+local gui,holder,fps,ping,playerCount,conn
 local dragConnections={}
-local presets={
-    ["Top Right"]=UDim2.new(.80,0,0,15),
-    ["Top Left"]=UDim2.new(.02,0,0,15),
-    ["Top Center"]=UDim2.new(.44,0,0,15),
-    ["Bottom Right"]=UDim2.new(.80,0,.85,0),
-    ["Bottom Left"]=UDim2.new(.02,0,.85,0)
-}
-local DEFAULT_POS=presets["Top Center"]
+local enabledToggle,colorToggle,lockToggle,fpsToggle,pingToggle,playersToggle
 
 local function root()
     if type(gethui)=="function" then
@@ -5588,43 +5626,48 @@ local function root()
     return player:WaitForChild("PlayerGui")
 end
 
-local function monitorScale(value)
-    -- Keep slider 1-10, but make 1 equal the old size-2 minimum (0.50x)
-    -- instead of the unreadably small 0.25x value.
-    local v=math.clamp(tonumber(value) or 1,1,10)
-    return 0.50+((v-1)/9)*2.00
-end
-
 local function savedPosition()
-    local data=PositionData["vv2FpsPingMonitorPosition"]
-    if type(data)=="table" then
-        return UDim2.new(
-            tonumber(data.xs or data.XS) or (presets[pos] or DEFAULT_POS).X.Scale,
-            tonumber(data.xo or data.XO) or (presets[pos] or DEFAULT_POS).X.Offset,
-            tonumber(data.ys or data.YS) or (presets[pos] or DEFAULT_POS).Y.Scale,
-            tonumber(data.yo or data.YO) or (presets[pos] or DEFAULT_POS).Y.Offset
-        )
-    end
-    return presets[pos] or presets["Top Right"]
+    return loadStoredPosition("vv2FpsPingMonitorPosition",DEFAULT_POS)
 end
 
 local function saveMonitorPosition(position)
     saveStoredPosition("vv2FpsPingMonitorPosition",position)
 end
 
-local function applySize()
-    if uiScale then uiScale.Scale=monitorScale(monitorSize) end
-end
-
-local function applyPosition(position,shouldSave)
-    if not holder then return end
-    holder.Position=position or savedPosition()
-    if shouldSave then saveMonitorPosition(holder.Position) end
-end
-
 local function clearDragConnections()
-    for _,c in ipairs(dragConnections) do pcall(function() c:Disconnect() end) end
+    for _,c in ipairs(dragConnections) do
+        pcall(function() c:Disconnect() end)
+    end
     table.clear(dragConnections)
+end
+
+local function anyStatEnabled()
+    return showFps or showPing or showPlayers
+end
+
+local function updateLayout()
+    if not holder then return end
+
+    local y=0
+    local function placeLabel(label,visible)
+        if not label then return end
+        label.Visible=visible
+        if visible then
+            label.Position=UDim2.fromOffset(0,y)
+            y+=28
+        end
+    end
+
+    placeLabel(fps,showFps)
+    placeLabel(ping,showPing)
+    placeLabel(playerCount,showPlayers)
+    holder.Size=UDim2.fromOffset(120,math.max(25,y>0 and (y-3) or 25))
+end
+
+local function beginDrag(input)
+    if locked or not holder then return end
+    if input.UserInputType~=Enum.UserInputType.MouseButton1 and input.UserInputType~=Enum.UserInputType.Touch then return end
+    return true
 end
 
 local function bindDragging()
@@ -5637,78 +5680,103 @@ local function bindDragging()
     local startPos=nil
     local moved=false
 
-    table.insert(dragConnections,holder.InputBegan:Connect(function(input)
-        if locked then return end
-        if input.UserInputType~=Enum.UserInputType.MouseButton1 and input.UserInputType~=Enum.UserInputType.Touch then return end
-        dragging=true
-        moved=false
-        dragStart=input.Position
-        startPos=holder.Position
-    end))
+    local function bindSource(source)
+        if not source then return end
+        source.Active=true
+        table.insert(dragConnections,source.InputBegan:Connect(function(input)
+            if not beginDrag(input) then return end
+            dragging=true
+            moved=false
+            dragStart=input.Position
+            startPos=holder.Position
+        end))
+        table.insert(dragConnections,source.InputChanged:Connect(function(input)
+            if input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch then
+                dragInput=input
+            end
+        end))
+    end
 
-    table.insert(dragConnections,holder.InputChanged:Connect(function(input)
-        if input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch then
-            dragInput=input
-        end
-    end))
+    bindSource(holder)
+    bindSource(fps)
+    bindSource(ping)
+    bindSource(playerCount)
 
     table.insert(dragConnections,UserInputService.InputChanged:Connect(function(input)
         if locked or not dragging or input~=dragInput or not holder then return end
         local delta=input.Position-dragStart
         if delta.Magnitude>7 then moved=true end
-        holder.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+delta.X,startPos.Y.Scale,startPos.Y.Offset+delta.Y)
+        holder.Position=UDim2.new(
+            startPos.X.Scale,
+            startPos.X.Offset+delta.X,
+            startPos.Y.Scale,
+            startPos.Y.Offset+delta.Y
+        )
     end))
 
     table.insert(dragConnections,UserInputService.InputEnded:Connect(function(input)
         if not dragging then return end
         if input.UserInputType~=Enum.UserInputType.MouseButton1 and input.UserInputType~=Enum.UserInputType.Touch then return end
         dragging=false
-        if moved and holder then saveMonitorPosition(holder.Position) end
+        if moved and holder then
+            saveMonitorPosition(holder.Position)
+        end
     end))
 end
 
 local function fpsColor(value,cap)
-    if value>=cap*.85 then return Color3.fromRGB(0,255,0) end
-    if value>=cap*.5 then return Color3.fromRGB(255,200,0) end
-    return Color3.fromRGB(255,0,0)
+    if value>=cap*.85 then return GREEN end
+    if value>=cap*.5 then return YELLOW end
+    return RED
 end
 
 local function pingColor(value)
-    if value<=80 then return Color3.fromRGB(0,255,0) end
-    if value<=150 then return Color3.fromRGB(255,200,0) end
-    return Color3.fromRGB(255,0,0)
+    if value<=80 then return GREEN end
+    if value<=150 then return YELLOW end
+    return RED
 end
 
 local function playersColor(count)
-    -- MM2 servers range from 1-12. Small = red, medium = yellow, high/full = green.
-    if count>=9 then return Color3.fromRGB(0,255,0) end
-    if count>=5 then return Color3.fromRGB(255,200,0) end
-    return Color3.fromRGB(255,0,0)
+    -- Lower MM2 population is lighter on the client; fuller servers trend red.
+    -- 1-4 = green, 5-8 = yellow, 9-12 = red.
+    if count<=4 then return GREEN end
+    if count<=8 then return YELLOW end
+    return RED
+end
+
+local function applyCurrentColors(f,p,count)
+    if fps then fps.TextColor3=colors and fpsColor(f or 0,workspace:GetAttribute("FPSCap") or 60) or BLACK end
+    if ping then ping.TextColor3=colors and pingColor(p or 0) or BLACK end
+    if playerCount then playerCount.TextColor3=colors and playersColor(count or #Players:GetPlayers()) or BLACK end
 end
 
 local function destroy()
     if conn then conn:Disconnect(); conn=nil end
     clearDragConnections()
     if gui then gui:Destroy(); gui=nil end
-    holder=nil; fps=nil; ping=nil; playerCount=nil; uiScale=nil
+    holder=nil
+    fps=nil
+    ping=nil
+    playerCount=nil
 end
 
-local function makeLabel(name,y)
+local function makeLabel(name)
     local label=Instance.new("TextLabel")
     label.Name=name
     label.BackgroundTransparency=1
-    label.Size=UDim2.new(0,120,0,25)
-    label.Position=UDim2.fromOffset(0,y)
+    label.BorderSizePixel=0
+    label.Size=UDim2.fromOffset(120,25)
     label.Font=Enum.Font.SourceSansLight
     label.TextScaled=true
     label.Text="0"
-    label.TextColor3=Color3.new(0,0,0)
+    label.TextColor3=BLACK
     label.Parent=holder
     return label
 end
 
 local function create()
     destroy()
+
     gui=Instance.new("ScreenGui")
     gui.Name="VisualsV2_FpsPingMonitor"
     gui.ResetOnSpawn=false
@@ -5724,95 +5792,173 @@ local function create()
     holder.Position=savedPosition()
     holder.Parent=gui
 
-    uiScale=Instance.new("UIScale")
-    uiScale.Name="VisualsV2_StatsScale"
-    uiScale.Parent=holder
-    applySize()
-
-    fps=makeLabel("VisualsV2_FPS",0)
-    ping=makeLabel("VisualsV2_Ping",28)
-    playerCount=makeLabel("VisualsV2_Players",56)
+    fps=makeLabel("VisualsV2_FPS")
+    ping=makeLabel("VisualsV2_Ping")
+    playerCount=makeLabel("VisualsV2_Players")
+    updateLayout()
     bindDragging()
 
-    local last=0
-    conn=RunService.RenderStepped:Connect(function(dt)
-        if not fps or not fps.Parent then return end
-        local f=math.floor(1/math.max(dt,0.0001)+.5)
-        fps.Text=tostring(f)
-        local cap=workspace:GetAttribute("FPSCap") or 60
-        fps.TextColor3=colors and fpsColor(f,cap) or Color3.new(0,0,0)
+    local lastPing=0
+    local lastPingUpdate=0
+    local lastPlayers=-1
 
-        if os.clock()-last>=.5 then
-            last=os.clock()
-            local p=0
+    conn=RunService.RenderStepped:Connect(function(dt)
+        if not holder or not holder.Parent then return end
+
+        local f=math.floor(1/math.max(dt,0.0001)+.5)
+        if fps then
+            fps.Text=tostring(f)
+            fps.TextColor3=colors and fpsColor(f,workspace:GetAttribute("FPSCap") or 60) or BLACK
+        end
+
+        local now=os.clock()
+        if now-lastPingUpdate>=0.5 then
+            lastPingUpdate=now
+
+            local p=lastPing
             pcall(function()
                 p=tonumber(Stats.Network.ServerStatsItem["Data Ping"]:GetValueString():match("%-?%d+")) or 0
             end)
-            ping.Text=tostring(p)
-            ping.TextColor3=colors and pingColor(p) or Color3.new(0,0,0)
+            lastPing=p
+            if ping then
+                ping.Text=tostring(p)
+                ping.TextColor3=colors and pingColor(p) or BLACK
+            end
 
             local count=#Players:GetPlayers()
-            playerCount.Text=tostring(count)
-            playerCount.TextColor3=colors and playersColor(count) or Color3.new(0,0,0)
+            if count~=lastPlayers then
+                lastPlayers=count
+                if playerCount then playerCount.Text=tostring(count).."/12" end
+            end
+            if playerCount then
+                playerCount.TextColor3=colors and playersColor(count) or BLACK
+            end
         end
     end)
 end
 
-local enabledToggle=addToggle(section,"VV2 Enable Monitor UI",enabled,function(v)
+local function forceAtLeastOneStat(preferred)
+    if not enabled or anyStatEnabled() then return end
+
+    if preferred=="ping" then
+        showPing=true
+        SetCfg("vv2MonitorShowPing",true)
+        task.defer(function() if pingToggle then pingToggle:Set(true) end end)
+    elseif preferred=="players" then
+        showPlayers=true
+        SetCfg("vv2MonitorShowPlayers",true)
+        task.defer(function() if playersToggle then playersToggle:Set(true) end end)
+    else
+        showFps=true
+        SetCfg("vv2MonitorShowFPS",true)
+        task.defer(function() if fpsToggle then fpsToggle:Set(true) end end)
+    end
+
+    updateLayout()
+end
+
+enabledToggle=addToggle(section,"VV2 Enable Monitor UI",enabled,function(v)
     enabled=v
     SetCfg("vv2FpsPingEnabled",v)
-    if v then create() else destroy() end
-end)
-local colorToggle=addToggle(section,"VV2 Enable Statistic Colors",colors,function(v)
-    colors=v
-    SetCfg("vv2FpsPingColors",v)
-end)
-local lockToggle=addToggle(section,"VV2 Lock Monitor Position",locked,function(v)
-    locked=v
-    SetCfg("vv2FpsPingLocked",v)
-end)
 
-local positionDropdown
-local positionDropdownReady=false
-positionDropdown=addDropdown(section,"VV2 UI Position",{"Top Right","Top Left","Top Center","Bottom Right","Bottom Left"},pos,function(v)
-    pos=v
-    SetCfg("vv2FpsPingPosition",v)
-    if positionDropdownReady then
-        local target=presets[v] or presets["Top Right"]
-        PositionData["vv2FpsPingMonitorPosition"]={xs=target.X.Scale,xo=target.X.Offset,ys=target.Y.Scale,yo=target.Y.Offset}
-        saveConfig()
-        if holder then holder.Position=target end
+    if v then
+        -- Fresh installs seed boolean options off. If the user enables the
+        -- monitor before choosing a stat, automatically show FPS so the main
+        -- feature can never be enabled with an empty display.
+        if not anyStatEnabled() then
+            showFps=true
+            SetCfg("vv2MonitorShowFPS",true)
+            task.defer(function() if fpsToggle then fpsToggle:Set(true) end end)
+        end
+        create()
+    else
+        destroy()
     end
 end)
-task.delay(0.15,function() positionDropdownReady=true end)
 
-section:AddSlider("VV2 Monitor Size",1,10,monitorSize,function(v)
-    monitorSize=math.clamp(tonumber(v) or 3,1,10)
-    SetCfg("vv2FpsPingSize",monitorSize)
-    applySize()
+fpsToggle=addToggle(section,"VV2 Show FPS",showFps,function(v)
+    showFps=v
+    if enabled and not anyStatEnabled() then
+        showFps=true
+        SetCfg("vv2MonitorShowFPS",true)
+        task.defer(function() if fpsToggle then fpsToggle:Set(true) end end)
+    else
+        SetCfg("vv2MonitorShowFPS",showFps)
+    end
+    updateLayout()
+end)
+
+pingToggle=addToggle(section,"VV2 Show Ping",showPing,function(v)
+    showPing=v
+    if enabled and not anyStatEnabled() then
+        showPing=true
+        SetCfg("vv2MonitorShowPing",true)
+        task.defer(function() if pingToggle then pingToggle:Set(true) end end)
+    else
+        SetCfg("vv2MonitorShowPing",showPing)
+    end
+    updateLayout()
+end)
+
+playersToggle=addToggle(section,"VV2 Show Players",showPlayers,function(v)
+    showPlayers=v
+    if enabled and not anyStatEnabled() then
+        showPlayers=true
+        SetCfg("vv2MonitorShowPlayers",true)
+        task.defer(function() if playersToggle then playersToggle:Set(true) end end)
+    else
+        SetCfg("vv2MonitorShowPlayers",showPlayers)
+    end
+    updateLayout()
+end)
+
+colorToggle=addToggle(section,"VV2 Enable Statistic Colors",colors,function(v)
+    colors=v
+    SetCfg("vv2FpsPingColors",v)
+
+    local f=tonumber(fps and fps.Text) or 0
+    local p=tonumber(ping and ping.Text) or 0
+    local count=#Players:GetPlayers()
+    applyCurrentColors(f,p,count)
+end)
+
+lockToggle=addToggle(section,"VV2 Lock Monitor Position",locked,function(v)
+    locked=v
+    SetCfg("vv2MonitorLocked",v)
 end)
 
 section:AddButton("Reset Monitor Position",function()
-    pos="Top Center"
-    SetCfg("vv2FpsPingPosition",pos)
-    PositionData["vv2FpsPingMonitorPosition"]={xs=DEFAULT_POS.X.Scale,xo=DEFAULT_POS.X.Offset,ys=DEFAULT_POS.Y.Scale,yo=DEFAULT_POS.Y.Offset}
-    saveConfig()
+    saveMonitorPosition(DEFAULT_POS)
     if holder then holder.Position=DEFAULT_POS end
-    if positionDropdown and type(positionDropdown.Select)=="function" then
-        pcall(function() positionDropdown:Select("Top Center") end)
-    end
 end)
 
 env.VisualsV2Runtime.RegisterReset(function()
     enabledToggle:Set(false)
+    fpsToggle:Set(false)
+    pingToggle:Set(false)
+    playersToggle:Set(false)
     colorToggle:Set(false)
     lockToggle:Set(false)
+
     enabled=false
+    showFps=false
+    showPing=false
+    showPlayers=false
     colors=false
     locked=false
     destroy()
 end)
-if enabled then task.defer(create) end
+
+if enabled then
+    task.defer(function()
+        if not anyStatEnabled() then
+            showFps=true
+            SetCfg("vv2MonitorShowFPS",true)
+            if fpsToggle then fpsToggle:Set(true) end
+        end
+        create()
+    end)
+end
 end)()
 
 ;(function()
@@ -6036,7 +6182,6 @@ end)()
 local creditsSection=mainTab:AddSection("Credits","")
 
 creditsSection:AddLabel("Belfor — 1306953439238164551")
-creditsSection:AddLabel("mrdaniel307228 — 1306953439238164551")
 creditsSection:AddLabel("SANGUINE — 1190101169184460931")
 creditsSection:AddLabel("NICOLAS — 1163360113092997120")
 creditsSection:AddLabel("b6o6s, A — 718910264942002277")
