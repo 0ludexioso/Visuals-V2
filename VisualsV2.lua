@@ -4710,6 +4710,8 @@ local function connectToTool(tool)
     hookedTools[tool]=true
     table.insert(watchConnections,tool.Activated:Connect(function()
         if not autoClutch or isOnCooldown then return end
+        local backpack=player:FindFirstChildOfClass("Backpack")
+        if tool.Parent~=player.Character and tool.Parent~=backpack then return end
         startOriginalCycle()
     end))
 end
@@ -4718,7 +4720,7 @@ local function scanForFireflies()
     local backpack=player:FindFirstChildOfClass("Backpack")
     local character=player.Character
 
-    for _,container in ipairs({backpack,character}) do
+    local function scanContainer(container)
         if container then
             for _,child in ipairs(container:GetChildren()) do
                 if child:IsA("Tool") and child.Name=="Fireflies" then
@@ -4727,6 +4729,8 @@ local function scanForFireflies()
             end
         end
     end
+    scanContainer(backpack)
+    scanContainer(character)
 end
 
 local function hookTool()
@@ -4849,6 +4853,13 @@ section:AddButton("Reset Firefly Timer Position",function()
     if timerLabel then timerLabel.Position=DEFAULT_POS end
 end)
 
+local fireflyRemovingConnection=player.CharacterRemoving:Connect(function()
+    stopCycle()
+end)
+local fireflyRespawnConnection=player.CharacterAdded:Connect(function()
+    stopCycle()
+end)
+
 env.VisualsV2Runtime.RegisterReset(function()
     autoToggle:Set(false)
     timerToggle:Set(false)
@@ -4859,6 +4870,8 @@ env.VisualsV2Runtime.RegisterReset(function()
     timerColors=false
     timerLocked=false
     unhookTool()
+    disconnect(fireflyRemovingConnection)
+    disconnect(fireflyRespawnConnection)
     for _,connection in ipairs(timerDragConnections) do disconnect(connection) end
     table.clear(timerDragConnections)
     if gui then gui:Destroy(); gui=nil; timerLabel=nil end
@@ -5263,81 +5276,93 @@ local inventoryEnabled=C("inventoryUnlimiterEnabled",false)
 local inventoryLimit=math.clamp(tonumber(C("inventoryMaxItems",10)) or 10,3,10)
 local autoGetTools=C("autoGetTools",false)
 local selectedToys={
-    C("autoToySlot1","None"),
-    C("autoToySlot2","None"),
-    C("autoToySlot3","None"),
-    C("autoToySlot4","None"),
+    C("autoToySlot1","None"), C("autoToySlot2","None"),
+    C("autoToySlot3","None"), C("autoToySlot4","None"),
 }
-
 local getupvalues=(debug and debug.getupvalues) or getupvalues
 local setupvalue=(debug and debug.setupvalue) or setupvalue
 local getinfo=(debug and debug.getinfo) or getinfo
 local getconstants=(debug and debug.getconstants) or getconstants
-
 local targetFunctions={}
 local targetsScanned=false
+local alive=true
+local recoveryToken=0
+local recoveryRunning=false
+local recoveryCharacter=nil
+local removingCharacter=nil
+local recoveryDeadline=0
+local rescanRequested=false
+local toyAttempts={}
+local observedBackpack=nil
+local backpackConnections={}
+local toyConnections={}
+local guiConnections={}
+local lifecycleConnections={}
+local dropdowns={}
+local refreshingDropdowns=false
+local guiRefreshToken=0
+local requestRecovery,refreshToyDropdowns
 
-local function discoverTargets()
-    if targetsScanned then return end
-    targetsScanned=true
+local function disconnectAll(connections)
+    for _,connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
+    table.clear(connections)
+end
+
+local function discoverTargets(force)
+    if targetsScanned and not force then return end
+    targetsScanned=false
     table.clear(targetFunctions)
-
     if not (type(getgc)=="function" and type(getupvalues)=="function"
-        and type(setupvalue)=="function" and type(getinfo)=="function") then
-        return
-    end
-
+        and type(setupvalue)=="function" and type(getinfo)=="function") then return end
     local okGc,objects=pcall(getgc)
     if not okGc or type(objects)~="table" then return end
-
     for _,f in ipairs(objects) do
         if type(f)=="function" then
             local success,info=pcall(getinfo,f)
-            if success and info then
+            if success and type(info)=="table" then
                 local isTarget=(info.name=="updateItemFrame" or info.name=="onItemEquipped")
-
                 if not isTarget and type(getconstants)=="function" then
                     local cSuccess,constants=pcall(getconstants,f)
                     if cSuccess and type(constants)=="table" then
                         local hasTouch,hasEquip=false,false
-                        for _,c in ipairs(constants) do
-                            if c=="TouchBinding" then hasTouch=true
-                            elseif c=="EquipButton" then hasEquip=true end
-                            if hasTouch and hasEquip then break end
+                        for _,value in pairs(constants) do
+                            if value=="TouchBinding" then hasTouch=true
+                            elseif value=="EquipButton" then hasEquip=true end
                         end
                         isTarget=hasTouch and hasEquip
                     end
                 end
-
-                if isTarget then
-                    table.insert(targetFunctions,f)
-                end
+                if isTarget then table.insert(targetFunctions,f) end
             end
         end
     end
+    -- An empty/early discovery must remain eligible for the next retry.
+    targetsScanned=#targetFunctions>0
 end
 
-local function applyInventoryLimit()
+local function applyInventoryLimit(force)
     if not inventoryEnabled then return end
-    discoverTargets()
-    if #targetFunctions==0 then return end
-
+    discoverTargets(force)
     for _,f in ipairs(targetFunctions) do
         local ok,upvalues=pcall(getupvalues,f)
         if ok and type(upvalues)=="table" then
-            for idx,val in ipairs(upvalues) do
-                if type(val)=="number" and val>=2 and val<=10 then
-                    pcall(setupvalue,f,idx,inventoryLimit)
+            for index,value in pairs(upvalues) do
+                if type(index)=="number" and type(value)=="number" and value>=2 and value<=10 then
+                    pcall(setupvalue,f,index,inventoryLimit)
                 end
             end
         end
     end
 end
 
+local function getBackpack()
+    if observedBackpack and observedBackpack.Parent==player then return observedBackpack end
+    return player:FindFirstChildOfClass("Backpack")
+end
+
 local function findToyFolder()
-    local bp=player:FindFirstChildOfClass("Backpack")
-    if not bp then return nil end
-    return bp:FindFirstChild("Toys")
+    local backpack=getBackpack()
+    return backpack and backpack:FindFirstChild("Toys") or nil
 end
 
 local function getToyNames()
@@ -5345,17 +5370,22 @@ local function getToyNames()
     local folder=findToyFolder()
     if folder then
         for _,toy in ipairs(folder:GetChildren()) do
-            if not table.find(names,toy.Name) then
-                table.insert(names,toy.Name)
-            end
+            if not table.find(names,toy.Name) then names[#names+1]=toy.Name end
         end
     end
     table.sort(names,function(a,b)
+        if a==b then return false end
         if a=="None" then return true end
         if b=="None" then return false end
         return a:lower()<b:lower()
     end)
     return names
+end
+
+local function hasSelectedTool(name,char,backpack)
+    local inCharacter=char and char:FindFirstChild(name)
+    local inBackpack=backpack and backpack:FindFirstChild(name)
+    return (inCharacter and inCharacter:IsA("Tool")) or (inBackpack and inBackpack:IsA("Tool")) or false
 end
 
 local function toyRemote()
@@ -5364,111 +5394,261 @@ local function toyRemote()
     local extras=remotes and remotes:FindFirstChild("Extras")
     local remote=extras and extras:FindFirstChild("ReplicateToy")
     if remote and remote:IsA("RemoteFunction") then return remote end
-    return nil
 end
 
-local function autoGetSelectedTools()
-    if not autoGetTools then return end
-    task.spawn(function()
-        local char=player.Character or player.CharacterAdded:Wait()
-        if char then char:WaitForChild("Humanoid",5) end
+local function cancelToyRequests()
+    for _,attempt in pairs(toyAttempts) do
+        if attempt.thread and type(task.cancel)=="function" then pcall(task.cancel,attempt.thread) end
+    end
+    table.clear(toyAttempts)
+end
 
-        local deadline=os.clock()+5
-        while not findToyFolder() and os.clock()<deadline do
+local function cancelRecovery()
+    recoveryToken=recoveryToken+1
+    recoveryRunning=false
+    recoveryCharacter=nil
+    recoveryDeadline=0
+    rescanRequested=false
+    cancelToyRequests()
+end
+
+local function isCurrentRecovery(token,char)
+    return alive and runtimeAlive and token==recoveryToken
+        and player.Character==char and char~=removingCharacter
+        and (inventoryEnabled or autoGetTools)
+end
+
+requestRecovery=function(forceScan)
+    if not alive or not runtimeAlive or not (inventoryEnabled or autoGetTools) then return end
+    local char=player.Character
+    if not char or char==removingCharacter then return end
+    if recoveryCharacter~=char then
+        cancelRecovery()
+        recoveryCharacter=char
+        targetsScanned=false
+        table.clear(targetFunctions)
+    end
+    if forceScan then rescanRequested=true end
+    recoveryDeadline=math.max(recoveryDeadline,os.clock()+20)
+    if recoveryRunning then return end
+    recoveryRunning=true
+    local token=recoveryToken
+    task.spawn(function()
+        local startedAt=os.clock()
+        local scanTimes={0,1,3,6,10,15}
+        local scanIndex=1
+        local nextInventoryApply=0
+        local nextToyRequest=0
+        while isCurrentRecovery(token,char) and os.clock()<recoveryDeadline do
+            local now=os.clock()
+            local humanoid=char:FindFirstChildOfClass("Humanoid")
+            if humanoid and humanoid.Health>0 then
+                local force=rescanRequested
+                if scanTimes[scanIndex] and now-startedAt>=scanTimes[scanIndex] then
+                    force=true
+                    repeat scanIndex=scanIndex+1
+                    until not scanTimes[scanIndex] or now-startedAt<scanTimes[scanIndex]
+                end
+                if inventoryEnabled and (force or (targetsScanned and now>=nextInventoryApply)) then
+                    applyInventoryLimit(force)
+                    nextInventoryApply=now+1
+                end
+                rescanRequested=false
+
+                if autoGetTools and now>=nextToyRequest then
+                    local backpack=getBackpack()
+                    local folder=findToyFolder()
+                    local remote=toyRemote()
+                    if backpack and folder and remote then
+                        local seen={}
+                        for slot=1,4 do
+                            local name=selectedToys[slot]
+                            if name and name~="None" and not seen[name] then
+                                seen[name]=true
+                                if folder:FindFirstChild(name) and not hasSelectedTool(name,char,backpack) then
+                                    local attempt=toyAttempts[name]
+                                    if not attempt then
+                                        attempt={count=0,nextAt=0,inFlight=false}
+                                        toyAttempts[name]=attempt
+                                    end
+                                    if not attempt.inFlight and attempt.count<6 and now>=attempt.nextAt then
+                                        attempt.count=attempt.count+1
+                                        attempt.nextAt=now+math.min(3,0.75+attempt.count*0.5)
+                                        attempt.inFlight=true
+                                        nextToyRequest=now+0.25
+                                        attempt.thread=task.spawn(function()
+                                            if isCurrentRecovery(token,char) and autoGetTools then
+                                                pcall(function() remote:InvokeServer(name) end)
+                                            end
+                                            attempt.inFlight=false
+                                            attempt.thread=nil
+                                        end)
+                                        break
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
             task.wait(0.2)
         end
+        if token==recoveryToken then recoveryRunning=false end
+    end)
+end
 
-        local remote=toyRemote()
-        if not remote then return end
-
-        for slot=1,4 do
-            local selected=selectedToys[slot]
-            if selected and selected~="None" then
-                pcall(function()
-                    remote:InvokeServer(selected)
-                end)
-                task.wait(0.25)
+refreshToyDropdowns=function()
+    local names=getToyNames()
+    refreshingDropdowns=true
+    for slot,dropdown in ipairs(dropdowns) do
+        if dropdown then
+            if type(dropdown.Change)=="function" then
+                pcall(dropdown.Change,names)
+            elseif type(dropdown.ChangeItems)=="function" then
+                pcall(function() dropdown:ChangeItems(names) end)
+            end
+            if type(dropdown.Select)=="function" then
+                local ok=pcall(dropdown.Select,selectedToys[slot])
+                if not ok then pcall(function() dropdown:Select(selectedToys[slot]) end) end
             end
         end
+    end
+    refreshingDropdowns=false
+end
+
+local function watchToyFolder(folder)
+    disconnectAll(toyConnections)
+    if not folder then return end
+    local function changed()
+        refreshToyDropdowns()
+        requestRecovery(false)
+    end
+    toyConnections[#toyConnections+1]=folder.ChildAdded:Connect(changed)
+    toyConnections[#toyConnections+1]=folder.ChildRemoved:Connect(changed)
+end
+
+local function watchBackpack(backpack)
+    disconnectAll(backpackConnections)
+    disconnectAll(toyConnections)
+    observedBackpack=backpack
+    if not backpack then return end
+    watchToyFolder(backpack:FindFirstChild("Toys"))
+    backpackConnections[#backpackConnections+1]=backpack.ChildAdded:Connect(function(child)
+        if child.Name=="Toys" then
+            watchToyFolder(child)
+            refreshToyDropdowns()
+            requestRecovery(false)
+        end
+    end)
+    backpackConnections[#backpackConnections+1]=backpack.ChildRemoved:Connect(function(child)
+        if child.Name=="Toys" then watchToyFolder(nil) end
+    end)
+    refreshToyDropdowns()
+end
+
+local function queueGuiRecovery()
+    guiRefreshToken=guiRefreshToken+1
+    local token=guiRefreshToken
+    task.delay(0.35,function()
+        if alive and token==guiRefreshToken then requestRecovery(true) end
+    end)
+end
+
+local function watchPlayerGui(gui)
+    disconnectAll(guiConnections)
+    if not gui then return end
+    guiConnections[#guiConnections+1]=gui.ChildAdded:Connect(function(child)
+        if child.Name=="MainGUI" or (child:IsA("ScreenGui") and child.Name:sub(1,10)~="VisualsV2_") then
+            queueGuiRecovery()
+        end
+    end)
+    guiConnections[#guiConnections+1]=gui.DescendantAdded:Connect(function(child)
+        if child.Name=="EquipButton" or child.Name=="TouchBinding" then queueGuiRecovery() end
     end)
 end
 
 local inventoryToggle=addToggle(section,"Unlimit Inventory",inventoryEnabled,function(state)
     inventoryEnabled=state
     SetCfg("inventoryUnlimiterEnabled",state)
-    if state then
-        -- A fresh scan is allowed each time it is manually re-enabled, but
-        -- repeated slider changes reuse the cached target functions.
-        targetsScanned=false
-        applyInventoryLimit()
-    end
+    if state then requestRecovery(true)
+    elseif not autoGetTools then cancelRecovery() end
 end)
-
 section:AddSlider("Max Items",3,10,inventoryLimit,function(value)
     inventoryLimit=math.clamp(math.floor(tonumber(value) or 10),3,10)
     SetCfg("inventoryMaxItems",inventoryLimit)
-    if inventoryEnabled then applyInventoryLimit() end
+    if inventoryEnabled then
+        if targetsScanned then applyInventoryLimit(false) end
+        requestRecovery(not targetsScanned)
+    end
 end)
-
 local autoToggle=addToggle(section,"Auto Get Tools",autoGetTools,function(state)
+    local wasEnabled=autoGetTools
     autoGetTools=state
     SetCfg("autoGetTools",state)
-    if state then autoGetSelectedTools() end
-end)
-
-local dropdowns={}
-local toyNames=getToyNames()
-
-for slot=1,4 do
-    dropdowns[slot]=addDropdown(
-        section,
-        "Select Toy Slot "..slot,
-        toyNames,
-        selectedToys[slot],
-        function(selected)
-            selectedToys[slot]=selected
-            SetCfg("autoToySlot"..slot,selected)
-            if autoGetTools and selected~="None" then
-                autoGetSelectedTools()
-            end
-        end
-    )
-end
-
-section:AddButton("Refresh Toy List",function()
-    local names=getToyNames()
-    for _,dropdown in ipairs(dropdowns) do
-        pcall(function()
-            if dropdown and dropdown.ChangeItems then
-                dropdown:ChangeItems(names)
-            end
-        end)
+    if state then
+        if not wasEnabled then cancelToyRequests() end
+        requestRecovery(false)
+    else
+        cancelToyRequests()
+        if not inventoryEnabled then cancelRecovery() end
     end
 end)
 
-player.CharacterAdded:Connect(function()
-    task.delay(0.8,function()
-        if inventoryEnabled then
-            -- Character replacement can replace MM2 UI closures.
-            targetsScanned=false
-            applyInventoryLimit()
-        end
-        if autoGetTools then
-            autoGetSelectedTools()
+local toyNames=getToyNames()
+for slot=1,4 do
+    dropdowns[slot]=addDropdown(section,"Select Toy Slot "..slot,toyNames,selectedToys[slot],function(selected)
+        if refreshingDropdowns then return end
+        selectedToys[slot]=selected
+        SetCfg("autoToySlot"..slot,selected)
+        if autoGetTools and selected~="None" then
+            local previous=toyAttempts[selected]
+            if not previous or not previous.inFlight then toyAttempts[selected]=nil end
+            requestRecovery(false)
         end
     end)
-end)
+end
+section:AddButton("Refresh Toy List",function() refreshToyDropdowns() end)
 
-if inventoryEnabled then
-    task.defer(applyInventoryLimit)
-end
-if autoGetTools then
-    task.defer(autoGetSelectedTools)
-end
+lifecycleConnections[#lifecycleConnections+1]=player.CharacterRemoving:Connect(function(char)
+    removingCharacter=char
+    cancelRecovery()
+    targetsScanned=false
+    table.clear(targetFunctions)
+end)
+lifecycleConnections[#lifecycleConnections+1]=player.CharacterAdded:Connect(function(char)
+    removingCharacter=nil
+    watchBackpack(player:FindFirstChildOfClass("Backpack"))
+    requestRecovery(true)
+end)
+lifecycleConnections[#lifecycleConnections+1]=player.ChildAdded:Connect(function(child)
+    if child:IsA("Backpack") then
+        watchBackpack(child)
+        requestRecovery(true)
+    elseif child:IsA("PlayerGui") then
+        watchPlayerGui(child)
+        requestRecovery(true)
+    end
+end)
+local replicatedStorage=game:GetService("ReplicatedStorage")
+lifecycleConnections[#lifecycleConnections+1]=replicatedStorage.DescendantAdded:Connect(function(child)
+    if child.Name=="Remotes" or child.Name=="Extras" or child.Name=="ReplicateToy" then requestRecovery(false) end
+end)
+watchBackpack(player:FindFirstChildOfClass("Backpack"))
+watchPlayerGui(player:FindFirstChildOfClass("PlayerGui"))
+if inventoryEnabled or autoGetTools then task.defer(function() requestRecovery(false) end) end
 
 env.VisualsV2Runtime.RegisterReset(function()
+    alive=false
+    guiRefreshToken=guiRefreshToken+1
+    cancelRecovery()
+    inventoryToggle:Set(false)
+    autoToggle:Set(false)
     inventoryEnabled=false
     autoGetTools=false
+    disconnectAll(lifecycleConnections)
+    disconnectAll(backpackConnections)
+    disconnectAll(toyConnections)
+    disconnectAll(guiConnections)
 end)
 end)()
 
