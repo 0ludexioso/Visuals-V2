@@ -39,7 +39,8 @@ local write = type(writefile) == "function" and writefile or env.writefile
 local exists = type(isfile) == "function" and isfile or env.isfile
 
 -- A fresh install means this add-on has never created its own settings JSON.
--- On that first execution, every boolean control is explicitly seeded OFF.
+-- On that first execution, feature toggles are seeded OFF except the requested
+-- timer, statistic-color, and individual statistic display defaults.
 local configExistedAtStart=false
 if type(exists)=="function" then
     local ok,result=pcall(exists,CFG_FILE)
@@ -48,6 +49,14 @@ elseif type(read)=="function" then
     configExistedAtStart=pcall(read,CFG_FILE)
 end
 local freshInstall=not configExistedAtStart
+local defaultOnControls={
+    fireflyTimerEnabled=true,
+    fireflyTimerColors=true,
+    vv2FpsPingColors=true,
+    vv2FpsPingShowFps=true,
+    vv2FpsPingShowPing=true,
+    vv2FpsPingShowPlayers=true,
+}
 
 local function isPositionKey(key)
     return type(key) == "string" and key:lower():find("position", 1, true) ~= nil
@@ -119,11 +128,10 @@ local function C(key, default)
     local value = source[key]
 
     if value == nil then
-        -- Never ship a first-install toggle already enabled. Non-boolean style
-        -- defaults (sizes, colors, dropdown choices, positions) keep their
-        -- intended defaults and are pre-seeded into the same JSON.
+        -- Feature toggles start disabled; the explicitly requested display
+        -- defaults keep their enabled state. Style defaults are unchanged.
         local seededDefault=default
-        if freshInstall and type(default)=="boolean" then
+        if freshInstall and type(default)=="boolean" and not defaultOnControls[key] then
             seededDefault=false
         end
 
@@ -3572,6 +3580,7 @@ section:AddButton("Rescan Shoot Murderer Button",function()
     local found=findButton()
     if found then bind(found); shared.Notify("Shoot Murderer button found.",2) else shared.Notify("Shoot Murderer button was not found.",2) end
 end)
+section:AddButton("Reset Shoot Murderer Button Position",resetShootMurdererPosition)
 
 task.defer(function()
     task.wait(0.5)
@@ -4290,7 +4299,7 @@ end)()
 ;(function()
 local section=mainTab:AddSection("Coin Aura","Utilities")
 local enabled=C("coinAuraEnabled",false)
-local radius=math.clamp(tonumber(C("coinAuraRadius",8)) or 8,1,8)
+local radius=math.clamp(tonumber(C("coinAuraRadius",8)) or 8,1,10)
 local conn=nil
 local function hasFireTouchInterest()
     return type(firetouchinterest)=="function"
@@ -4358,7 +4367,10 @@ local toggle=addToggle(section,"VV2 Coin Aura",enabled,function(v)
 
     refresh()
 end)
-section:AddSlider("VV2 Coin Aura Radius",1,8,radius,function(v) radius=v; SetCfg("coinAuraRadius",v) end)
+section:AddSlider("VV2 Coin Aura Radius",1,10,radius,function(v)
+    radius=math.clamp(tonumber(v) or 8,1,10)
+    SetCfg("coinAuraRadius",radius)
+end)
 env.VisualsV2Runtime.RegisterReset(function() toggle:Set(false); enabled=false; if conn then conn:Disconnect(); conn=nil end end)
 if enabled then refresh() end
 end)()
@@ -4370,6 +4382,8 @@ end)()
 ;(function()
 local section=mainTab:AddSection("Firefly Clutch","Utilities")
 local autoClutch=C("fireflyAutoClutch",false)
+local timerEnabled=C("fireflyTimerEnabled",true)
+local timerColors=C("fireflyTimerColors",true)
 local timerSize=math.clamp(tonumber(C("fireflyTimerSize",10)) or 10,1,10)
 if tonumber(ConfigData["fireflyTimerSize"])==5 then
     timerSize=10
@@ -4416,6 +4430,28 @@ local cycleStartedAt=nil
 local countdownEndsAt=nil
 local cooldownEndsAt=nil
 
+local function updateTimerDisplay()
+    if not timerLabel then return end
+    timerLabel.Visible=timerEnabled
+    if not timerEnabled then return end
+
+    local now=os.clock()
+    local remaining,total
+    if countdownEndsAt and now<countdownEndsAt then
+        remaining,total=countdownEndsAt-now,COUNTDOWN
+    elseif cooldownEndsAt and now<cooldownEndsAt then
+        remaining,total=cooldownEndsAt-now,COOLDOWN
+    end
+
+    if remaining then
+        timerLabel.Text=string.format("%.1fCD",math.max(0,remaining))
+        timerLabel.TextColor3=timerColors and timerCountdownColor(remaining,total) or TIMER_BLACK
+    else
+        timerLabel.Text="Active"
+        timerLabel.TextColor3=TIMER_BLACK
+    end
+end
+
 local function disconnect(conn)
     if conn then pcall(function() conn:Disconnect() end) end
 end
@@ -4456,11 +4492,12 @@ local function buildTimer()
     timerLabel.TextColor3=Color3.new(0,0,0)
     timerLabel.TextStrokeTransparency=1
     timerLabel.Font=Enum.Font.GothamBold
-    timerLabel.Text=""
-    timerLabel.Visible=false
+    timerLabel.Text="Active"
+    timerLabel.Visible=timerEnabled
     timerLabel.Active=true
     timerLabel.Parent=gui
     applyTimerSize()
+    updateTimerDisplay()
 
     local dragging=false
     local moved=false
@@ -4478,7 +4515,7 @@ local function buildTimer()
         if input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch then dragInput=input end
     end)
     UserInputService.InputChanged:Connect(function(input)
-        if not dragging or input~=dragInput then return end
+        if not dragging or timerLocked or not timerEnabled or not timerLabel or input~=dragInput then return end
         local delta=input.Position-dragStart
         if delta.Magnitude>7 then moved=true end
         timerLabel.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+delta.X,startPos.Y.Scale,startPos.Y.Offset+delta.Y)
@@ -4528,11 +4565,7 @@ local function stopCycle()
     cycleStartedAt=nil
     countdownEndsAt=nil
     cooldownEndsAt=nil
-    if timerLabel then
-        timerLabel.Visible=false
-        timerLabel.Text=""
-        timerLabel.TextColor3=TIMER_BLACK
-    end
+    updateTimerDisplay()
 end
 
 -- Same activation/cooldown/jump behavior as the attached FFC addon. The only
@@ -4543,7 +4576,7 @@ local function startCountdown()
     disconnect(countdownConnection)
     countdownConnection=nil
     jumpTriggered=false
-    timerLabel.Visible=true
+    updateTimerDisplay()
 
     countdownConnection=RunService.Heartbeat:Connect(function()
         if not countdownEndsAt then return end
@@ -4557,8 +4590,7 @@ local function startCountdown()
             jumpTriggered=true
             startTwoJumpSequence(cycleToken)
         end
-        timerLabel.TextColor3=timerCountdownColor(remaining,COUNTDOWN)
-        timerLabel.Text=string.format("%.1fCD",math.max(0,remaining))
+        updateTimerDisplay()
     end)
 end
 
@@ -4572,22 +4604,12 @@ local function startCooldownPanel()
         if countdownEndsAt and now<countdownEndsAt then return end
         local remaining=cooldownEndsAt-now
         if remaining<=0 then
-            timerLabel.TextColor3=TIMER_BLACK
-            timerLabel.Text="Active"
-            task.delay(0.6,function()
-                if timerLabel and not isOnCooldown then
-                    timerLabel.Visible=false
-                    timerLabel.Text=""
-                    timerLabel.TextColor3=TIMER_BLACK
-                end
-            end)
+            updateTimerDisplay()
             disconnect(cooldownConnection)
             cooldownConnection=nil
             return
         end
-        timerLabel.Visible=true
-        timerLabel.TextColor3=timerCountdownColor(remaining,COOLDOWN)
-        timerLabel.Text=string.format("%.1fCD",remaining)
+        updateTimerDisplay()
     end)
 end
 
@@ -4716,11 +4738,7 @@ local function unhookTool()
     countdownEndsAt=nil
     cooldownEndsAt=nil
 
-    if timerLabel then
-        timerLabel.Visible=false
-        timerLabel.Text=""
-        timerLabel.TextColor3=TIMER_BLACK
-    end
+    updateTimerDisplay()
 end
 
 local autoToggle=addToggle(section,"Auto Firefly Clutch",autoClutch,function(state)
@@ -4737,6 +4755,19 @@ local autoToggle=addToggle(section,"Auto Firefly Clutch",autoClutch,function(sta
     end
 end)
 
+local timerToggle=addToggle(section,"Enable Firefly Timer",timerEnabled,function(state)
+    timerEnabled=state
+    SetCfg("fireflyTimerEnabled",state)
+    buildTimer()
+    updateTimerDisplay()
+end)
+
+local timerColorToggle=addToggle(section,"Enable Statistic Colors",timerColors,function(state)
+    timerColors=state
+    SetCfg("fireflyTimerColors",state)
+    updateTimerDisplay()
+end)
+
 section:AddSlider("Firefly Timer Size",1,10,timerSize,function(value)
     timerSize=math.clamp(tonumber(value) or 5,1,10)
     SetCfg("fireflyTimerSize",timerSize)
@@ -4748,10 +4779,19 @@ local fireflyLockToggle=addToggle(section,"Lock Firefly Timer Position",timerLoc
     SetCfg("fireflyTimerLocked",state)
 end)
 
+section:AddButton("Reset Firefly Timer Position",function()
+    saveStoredPosition("fireflyTimerPosition",DEFAULT_POS)
+    if timerLabel then timerLabel.Position=DEFAULT_POS end
+end)
+
 env.VisualsV2Runtime.RegisterReset(function()
     autoToggle:Set(false)
+    timerToggle:Set(false)
+    timerColorToggle:Set(false)
     fireflyLockToggle:Set(false)
     autoClutch=false
+    timerEnabled=false
+    timerColors=false
     timerLocked=false
     unhookTool()
     if gui then gui:Destroy(); gui=nil; timerLabel=nil end
@@ -5367,63 +5407,17 @@ end)()
 
 
 -- =========================================================
--- GENERAL BUTTON POSITIONS
--- =========================================================
-
-;(function()
-local positionSection=mainTab:AddSection("Button Positions","Settings")
-positionSection:AddParagraph(
-    "General Button Positions",
-    "Movable VisualsV2 buttons save their positions automatically. Reset them here to their standard locations."
-)
-
-positionSection:AddButton("Reset Speed Big Button Position",function()
-    PositionData["speedButtonPosition"]=nil
-    saveConfig()
-    if speedButton then
-        speedButton.Position=BIG_BUTTON_DEFAULT
-    end
-end)
-
-positionSection:AddButton("Reset Speed Bind Button Position",function()
-    PositionData["speedBindButtonPosition"]=nil
-    saveConfig()
-    BindableButtons:SetPosition("VisualsV2_SpeedBind",BIND_BUTTON_DEFAULT)
-end)
-
-positionSection:AddButton("Reset Shoot Murderer Button Position",function()
-    if type(env.VisualsV2ResetShootMurdererPosition)=="function" then
-        env.VisualsV2ResetShootMurdererPosition()
-    else
-        PositionData["shootMurdButtonPosition"]=nil
-        saveConfig()
-    end
-end)
-
-positionSection:AddButton("Reset Firefly Timer Position",function()
-    local centeredTop=UDim2.new(0.5,0,0.05,0)
-    PositionData["fireflyTimerPosition"]={
-        xs=centeredTop.X.Scale,
-        xo=centeredTop.X.Offset,
-        ys=centeredTop.Y.Scale,
-        yo=centeredTop.Y.Offset,
-    }
-    saveConfig()
-
-    -- Firefly variables are scoped to its section, so locate its namespaced GUI.
-    local pg=player:FindFirstChildOfClass("PlayerGui")
-    local timerGui=pg and pg:FindFirstChild("VisualsV2_FireflyTimer")
-    local label=timerGui and timerGui:FindFirstChild("FireflyTimer")
-    if label then label.Position=centeredTop end
-end)
-end)()
-
--- =========================================================
 -- MISCELLANEOUS
 -- =========================================================
 
 ;(function()
 local miscSection=mainTab:AddSection("Miscellaneous","Settings")
+miscSection:AddButton("Reset Big/Bind Button Position",function()
+    saveStoredPosition("speedButtonPosition",BIG_BUTTON_DEFAULT)
+    saveStoredPosition("speedBindButtonPosition",BIND_BUTTON_DEFAULT)
+    if speedButton then speedButton.Position=BIG_BUTTON_DEFAULT end
+    BindableButtons:SetPosition("VisualsV2_SpeedBind",BIND_BUTTON_DEFAULT)
+end)
 addToggle(miscSection,"Lock Big Button POS",lockBigButtonPos,function(state)
     lockBigButtonPos=state
     SetCfg("lockBigButtonPos",state)
@@ -5477,13 +5471,18 @@ saveConfig()
 local performanceTab=mainTab
 
 ;(function()
-local section=performanceTab:AddSection("FPS, Ping & Players Monitor","Performance")
+local section=performanceTab:AddSection("FPS, Plyr, & Ping","Performance")
 local Stats=game:GetService("Stats")
 local enabled=C("vv2FpsPingEnabled",false)
-local colors=C("vv2FpsPingColors",false)
+local colors=C("vv2FpsPingColors",true)
+local showFps=C("vv2FpsPingShowFps",true)
+local showPing=C("vv2FpsPingShowPing",true)
+local showPlayers=C("vv2FpsPingShowPlayers",true)
+local monitorSize=math.clamp(tonumber(C("vv2FpsPingSize",5)) or 5,1,10)
 local pos=C("vv2FpsPingPosition","Top Right")
 local locked=C("vv2FpsPingLocked",false)
-local gui,holder,fps,ping,playersLabel,renderConn
+local gui,holder,fps,ping,playersLabel,monitorScale,renderConn
+local lastFps=0
 local dragConnections={}
 local presets={
     ["Top Right"]=UDim2.new(.80,0,0,15),
@@ -5583,6 +5582,41 @@ local function makeLabel(name,y)
     return label
 end
 
+local function applyMonitorLayout()
+    if not holder then return end
+    local visible={showFps,showPing,showPlayers}
+    local y=0
+    for i,label in ipairs({fps,ping,playersLabel}) do
+        label.Visible=visible[i]
+        if visible[i] then
+            label.Position=UDim2.fromOffset(0,y)
+            y+=28
+        end
+    end
+    holder.Size=UDim2.fromOffset(120,math.max(1,y-3))
+    holder.Visible=showFps or showPing or showPlayers
+    if monitorScale then monitorScale.Scale=monitorSize/5 end
+end
+
+local function updateMonitorStats(value)
+    if not fps or not fps.Parent then return end
+    if value~=nil then lastFps=value end
+    local cap=workspace:GetAttribute("FPSCap") or 60
+    fps.Text=tostring(lastFps)
+    fps.TextColor3=fpsColor(lastFps,cap)
+
+    local p=0
+    pcall(function()
+        p=tonumber(Stats.Network.ServerStatsItem["Data Ping"]:GetValueString():match("%-?%d+")) or 0
+    end)
+    ping.Text=tostring(p)
+    ping.TextColor3=pingColor(p)
+
+    local count=#Players:GetPlayers()
+    playersLabel.Text=tostring(count)
+    playersLabel.TextColor3=playerCountColor(count)
+end
+
 local function setupDragging()
     disconnectDragConnections()
     if not holder then return end
@@ -5629,7 +5663,7 @@ local function destroy()
     if renderConn then renderConn:Disconnect(); renderConn=nil end
     disconnectDragConnections()
     if gui then gui:Destroy(); gui=nil end
-    holder=nil; fps=nil; ping=nil; playersLabel=nil
+    holder=nil; fps=nil; ping=nil; playersLabel=nil; monitorScale=nil
 end
 
 local function create()
@@ -5649,34 +5683,27 @@ local function create()
     holder.Position=decodeSavedPosition(presets[pos] or presets["Top Right"])
     holder.Parent=gui
 
+    monitorScale=Instance.new("UIScale")
+    monitorScale.Name="VisualsV2_MonitorScale"
+    monitorScale.Parent=holder
+
     fps=makeLabel("VisualsV2_FPS",0)
     ping=makeLabel("VisualsV2_Ping",28)
     playersLabel=makeLabel("VisualsV2_Players",56)
+    applyMonitorLayout()
+    lastFps=0
+    updateMonitorStats()
     setupDragging()
 
-    local lastUpdate=0
+    local elapsed,frameCount=0,0
     renderConn=RunService.RenderStepped:Connect(function(dt)
         if not fps or not fps.Parent then return end
-
-        local f=math.floor(1/math.max(dt,1/1000)+.5)
-        local cap=workspace:GetAttribute("FPSCap") or 60
-        fps.Text=tostring(f)
-        fps.TextColor3=fpsColor(f,cap)
-
-        local now=os.clock()
-        if now-lastUpdate>=.5 then
-            lastUpdate=now
-
-            local p=0
-            pcall(function()
-                p=tonumber(Stats.Network.ServerStatsItem["Data Ping"]:GetValueString():match("%-?%d+")) or 0
-            end)
-            ping.Text=tostring(p)
-            ping.TextColor3=pingColor(p)
-
-            local count=#Players:GetPlayers()
-            playersLabel.Text=tostring(count)
-            playersLabel.TextColor3=playerCountColor(count)
+        elapsed+=math.max(dt,0)
+        frameCount+=1
+        if elapsed>=.5 then
+            local averageFps=math.floor(frameCount/math.max(elapsed,1/1000)+.5)
+            elapsed,frameCount=0,0
+            updateMonitorStats(averageFps)
         end
     end)
 end
@@ -5690,11 +5717,31 @@ end)
 local colorToggle=addToggle(section,"VV2 Enable Statistic Colors",colors,function(v)
     colors=v
     SetCfg("vv2FpsPingColors",v)
-    if not v then
-        if fps then fps.TextColor3=BLACK end
-        if ping then ping.TextColor3=BLACK end
-        if playersLabel then playersLabel.TextColor3=BLACK end
-    end
+    updateMonitorStats()
+end)
+
+local fpsToggle=addToggle(section,"Show FPS",showFps,function(v)
+    showFps=v
+    SetCfg("vv2FpsPingShowFps",v)
+    applyMonitorLayout()
+end)
+
+local pingToggle=addToggle(section,"Show Ping",showPing,function(v)
+    showPing=v
+    SetCfg("vv2FpsPingShowPing",v)
+    applyMonitorLayout()
+end)
+
+local playersToggle=addToggle(section,"Show Player Count",showPlayers,function(v)
+    showPlayers=v
+    SetCfg("vv2FpsPingShowPlayers",v)
+    applyMonitorLayout()
+end)
+
+section:AddSlider("Monitor Size",1,10,monitorSize,function(value)
+    monitorSize=math.clamp(tonumber(value) or 5,1,10)
+    SetCfg("vv2FpsPingSize",monitorSize)
+    applyMonitorLayout()
 end)
 
 local lockToggle=addToggle(section,"Lock Monitor Position",locked,function(v)
@@ -5702,46 +5749,25 @@ local lockToggle=addToggle(section,"Lock Monitor Position",locked,function(v)
     SetCfg("vv2FpsPingLocked",v)
 end)
 
-local hasSavedCustomPosition=type(PositionData[POSITION_KEY])=="table"
-local firstPositionCallback=true
-local posDropdown=addDropdown(
-    section,
-    "VV2 UI Position",
-    {"Top Right","Top Left","Top Center","Bottom Right","Bottom Left"},
-    pos,
-    function(v)
-        pos=v
-        SetCfg("vv2FpsPingPosition",v)
-
-        -- Preserve an existing dragged position when the dropdown initializes.
-        if firstPositionCallback and hasSavedCustomPosition then
-            firstPositionCallback=false
-            return
-        end
-        firstPositionCallback=false
-
-        local target=presets[v] or presets["Top Center"]
-        setMonitorPosition(target,true)
-    end
-)
-
 section:AddButton("Reset Monitor Position",function()
     pos="Top Center"
     SetCfg("vv2FpsPingPosition",pos)
     setMonitorPosition(presets["Top Center"],true)
 
-    if posDropdown and type(posDropdown.Select)=="function" then
-        pcall(posDropdown.Select,"Top Center")
-        pcall(function() posDropdown:Select("Top Center") end)
-    end
 end)
 
 env.VisualsV2Runtime.RegisterReset(function()
     monitorToggle:Set(false)
     colorToggle:Set(false)
+    fpsToggle:Set(false)
+    pingToggle:Set(false)
+    playersToggle:Set(false)
     lockToggle:Set(false)
     enabled=false
     colors=false
+    showFps=false
+    showPing=false
+    showPlayers=false
     locked=false
     destroy()
 end)
