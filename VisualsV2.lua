@@ -4933,8 +4933,8 @@ local timerSize=math.clamp(tonumber(C("fireflyTimerSize",10)) or 10,1,10)
 local timerLocked=C("fireflyTimerLocked",false)
 local COUNTDOWN=2.5
 local COOLDOWN=16
-local TRIGGER_POINT=0.23
-local BURST_DURATION=0.5
+local TRIGGER_POINT=0.24
+local JUMP_GAP=0.40
 local TIMER_GREEN=Color3.fromRGB(0,255,0)
 local TIMER_YELLOW=Color3.fromRGB(255,200,0)
 local TIMER_RED=Color3.fromRGB(255,0,0)
@@ -4959,7 +4959,7 @@ local isOnCooldown=false
 local jumpTriggered=false
 local cycleToken=0
 local cycleStartedAt=nil
-local countdownEndsAt=nil
+local countdownRemaining=nil
 local cooldownEndsAt=nil
 
 local function updateTimerDisplay()
@@ -4969,8 +4969,8 @@ local function updateTimerDisplay()
 
     local now=os.clock()
     local remaining,total
-    if countdownEndsAt and now<countdownEndsAt then
-        remaining,total=countdownEndsAt-now,COUNTDOWN
+    if countdownRemaining and countdownRemaining>0 then
+        remaining,total=countdownRemaining,COUNTDOWN
     elseif cooldownEndsAt and now<cooldownEndsAt then
         remaining,total=cooldownEndsAt-now,COOLDOWN
     end
@@ -5077,7 +5077,7 @@ local function startTwoJumpSequence(myCycle)
     -- Debug addon behavior: first jump near the end of the 2.5s countdown,
     -- then a second jump 0.40 seconds later.
     fireJump()
-    task.delay(0.40,function()
+    task.delay(JUMP_GAP,function()
         if autoClutch and myCycle==cycleToken then
             fireJump()
         end
@@ -5095,34 +5095,35 @@ local function stopCycle()
     isOnCooldown=false
     jumpTriggered=false
     cycleStartedAt=nil
-    countdownEndsAt=nil
+    countdownRemaining=nil
     cooldownEndsAt=nil
     updateTimerDisplay()
 end
 
--- Same activation/cooldown/jump behavior as the attached FFC addon. The only
--- change is that both original timer panels are rendered in one transparent label.
+-- Match the Debug reference's Heartbeat countdown and jump threshold. The
+-- displayed countdown uses the same remaining time that triggers the first jump.
 local function startCountdown()
     if not autoClutch then return end
     buildTimer()
     disconnect(countdownConnection)
     countdownConnection=nil
     jumpTriggered=false
+    local myCycle=cycleToken
     updateTimerDisplay()
 
-    countdownConnection=RunService.Heartbeat:Connect(function()
-        if not countdownEndsAt then return end
-        local remaining=countdownEndsAt-os.clock()
-        if remaining<=0 then
-            disconnect(countdownConnection)
-            countdownConnection=nil
-            return
-        end
-        if not jumpTriggered and remaining<=TRIGGER_POINT then
+    countdownConnection=RunService.Heartbeat:Connect(function(dt)
+        if not autoClutch or myCycle~=cycleToken or not countdownRemaining then return end
+        countdownRemaining=math.max(0,countdownRemaining-dt)
+        if not jumpTriggered and countdownRemaining<=TRIGGER_POINT then
             jumpTriggered=true
-            startTwoJumpSequence(cycleToken)
+            startTwoJumpSequence(myCycle)
         end
         updateTimerDisplay()
+        -- Trigger before finishing even if a slow frame crosses the whole window.
+        if countdownRemaining<=0 then
+            disconnect(countdownConnection)
+            countdownConnection=nil
+        end
     end)
 end
 
@@ -5133,7 +5134,7 @@ local function startCooldownPanel()
     cooldownConnection=RunService.Heartbeat:Connect(function()
         if not cycleStartedAt or not cooldownEndsAt then return end
         local now=os.clock()
-        if countdownEndsAt and now<countdownEndsAt then return end
+        if countdownRemaining and countdownRemaining>0 then return end
         local remaining=cooldownEndsAt-now
         if remaining<=0 then
             updateTimerDisplay()
@@ -5163,7 +5164,7 @@ local function startOriginalCycle()
     buildTimer()
     cycleToken+=1
     cycleStartedAt=os.clock()
-    countdownEndsAt=cycleStartedAt+COUNTDOWN
+    countdownRemaining=COUNTDOWN
     cooldownEndsAt=cycleStartedAt+COOLDOWN
     startCountdown()
     startCooldownPanel()
@@ -5271,7 +5272,7 @@ local function unhookTool()
     isOnCooldown=false
     jumpTriggered=false
     cycleStartedAt=nil
-    countdownEndsAt=nil
+    countdownRemaining=nil
     cooldownEndsAt=nil
 
     updateTimerDisplay()
