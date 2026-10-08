@@ -3642,8 +3642,410 @@ end)()
 -- Highlight-only Gun/Knife visuals so there is no tint-mode conflict.
 -- =========================================================
 
+-- =========================================================
+-- VISUALS: EQUIPPED WEAPON / TOOL CHAMS
+-- ForceField, Flat and Chromatic renderers adapted from anya_bts's Tool Chams.
+-- Existing weapon/tool colour controls are reused; source colours are untouched.
+-- =========================================================
+
 ;(function()
-local section=mainTab:AddSection("Guns & Knives","Visuals")
+local runtime=env.VisualsV2Runtime
+local presets={"ForceField","Flat","Chromatic"}
+local groups,states={},{}
+local trackedCharacter,removingCharacter
+local characterConnections,lifecycleConnections={},{}
+local heartbeatConnection,chromConnection
+local chromHost,chromView,chromWorld,chromCamera
+local dirty,queued,resetting=true,false,false
+local ownedSurfaces={}
+local CHROM_SCALE,CHROM_ALPHA=1.012,0.025
+
+local function disconnectAll(connections)
+    for _,connection in ipairs(connections) do connection:Disconnect() end
+    table.clear(connections)
+end
+
+local function presetName(value)
+    if type(value)=="table" then value=value[1] end
+    for _,preset in ipairs(presets) do if value==preset then return value end end
+    return "ForceField"
+end
+
+local function groupFor(tool)
+    if not tool or not tool:IsA("Tool") then return nil end
+    for _,group in ipairs(groups) do
+        if group.enabled and group.matches(tool) then return group end
+    end
+end
+
+local function usesOverlay(tool)
+    local group=tool and tool.Parent==player.Character and tool.Parent~=removingCharacter and groupFor(tool)
+    return group~=nil and group~=false and group.preset~="ForceField"
+end
+runtime.ChamsUsesOverlay=usesOverlay
+
+local function refreshHighlights()
+    if type(runtime.RefreshGunsKnives)=="function" then runtime.RefreshGunsKnives() end
+    if type(runtime.RefreshToolTint)=="function" then runtime.RefreshToolTint() end
+end
+
+local function clearFlat(state)
+    if state.flat then state.flat:Destroy() end
+    state.flat,state.flatHighlight,state.visibleHighlight,state.flatEntries=nil,nil,nil,nil
+end
+
+local function clearChromatic(state)
+    if state.chrom then state.chrom:Destroy() end
+    state.chrom,state.chromEntries,state.chromColor=nil,nil,nil
+end
+
+local function restoreMaterial(state)
+    for part,material in pairs(state.materials) do
+        pcall(function()
+            -- Skin ForceField can also own this material. Preserve its active
+            -- layer and its original-material attribute when the layers overlap.
+            if runtimeAlive and not configResetting and ConfigData.ffEnabled then
+                local saved=part:GetAttribute("VisualsV2_OriginalMaterial")
+                if saved=="ForceField" and material~=Enum.Material.ForceField then
+                    part:SetAttribute("VisualsV2_OriginalMaterial",material.Name)
+                end
+                part.Material=Enum.Material.ForceField
+            else
+                part.Material=material
+            end
+        end)
+    end
+    table.clear(state.materials)
+    for appearance,parent in pairs(state.surfaces) do
+        pcall(function() appearance.Parent=parent end)
+        ownedSurfaces[appearance]=nil
+    end
+    table.clear(state.surfaces)
+end
+
+local function clearState(state)
+    clearFlat(state)
+    clearChromatic(state)
+    restoreMaterial(state)
+end
+
+local function destroyViewport()
+    if chromConnection then chromConnection:Disconnect(); chromConnection=nil end
+    if chromHost then chromHost:Destroy() end
+    chromHost,chromView,chromWorld,chromCamera=nil,nil,nil,nil
+end
+
+local function ensureViewport()
+    if chromWorld and chromWorld.Parent and chromHost and chromHost.Parent then return true end
+    destroyViewport()
+    local parent=player:FindFirstChildOfClass("PlayerGui")
+    if not parent and type(gethui)=="function" then
+        local ok,value=pcall(gethui)
+        if ok then parent=value end
+    end
+    if not parent then return false end
+    chromHost=Instance.new("ScreenGui")
+    chromHost.Name="VisualsV2_ChamsViewport"
+    chromHost.ResetOnSpawn=false
+    chromHost.IgnoreGuiInset=true
+    chromHost.DisplayOrder=100
+    chromHost.Parent=parent
+    chromView=Instance.new("ViewportFrame")
+    chromView.Name="ChamsViewport"
+    chromView.Size=UDim2.fromScale(1,1)
+    chromView.Position=UDim2.fromScale(0,0)
+    chromView.BackgroundTransparency=1
+    chromView.BorderSizePixel=0
+    chromView.Ambient=Color3.new(1,1,1)
+    chromView.LightColor=Color3.new(1,1,1)
+    chromView.LightDirection=Vector3.new(-1,-1,-1)
+    chromView.ZIndex=999
+    chromView.Parent=chromHost
+    chromCamera=Instance.new("Camera")
+    chromCamera.Name="VisualsV2_ChamsCamera"
+    chromCamera.Parent=chromView
+    chromView.CurrentCamera=chromCamera
+    local sky=Lighting:FindFirstChildOfClass("Sky")
+    if sky then pcall(function() sky:Clone().Parent=chromView end) end
+    chromWorld=Instance.new("WorldModel")
+    chromWorld.Name="ChamsWorld"
+    chromWorld.Parent=chromView
+    chromConnection=RunService.RenderStepped:Connect(function()
+        local cameraNow=workspace.CurrentCamera
+        if cameraNow and chromCamera then
+            chromCamera.CFrame=cameraNow.CFrame
+            chromCamera.FieldOfView=cameraNow.FieldOfView
+            chromCamera.FieldOfViewMode=cameraNow.FieldOfViewMode
+        end
+        for tool,state in pairs(states) do
+            if state.chromEntries then
+                for _,entry in ipairs(state.chromEntries) do
+                    local source,clone=entry[1],entry[2]
+                    local visible=source.Parent and tool.Parent==player.Character
+                        and math.max(source.Transparency,source.LocalTransparencyModifier)<1
+                    if source.Parent then clone.CFrame=source.CFrame end
+                    clone.Transparency=visible and CHROM_ALPHA or 1
+                end
+            end
+        end
+    end)
+    return true
+end
+
+local function deformable(part)
+    if part:FindFirstChildWhichIsA("WrapLayer") or part:FindFirstChildWhichIsA("Bone") then return true end
+    local ok,skinned=pcall(function() return part.HasSkinnedMesh end)
+    return ok and skinned==true
+end
+
+local function shell(source,scale)
+    local archivable=source.Archivable
+    if not archivable and not pcall(function() source.Archivable=true end) then return nil end
+    local ok,clone=pcall(function() return source:Clone() end)
+    if not archivable then pcall(function() source.Archivable=archivable end) end
+    if not ok or not clone then return nil end
+    for _,child in ipairs(clone:GetChildren()) do
+        if not child:IsA("DataModelMesh") then child:Destroy() end
+    end
+    local mesh=clone:FindFirstChildWhichIsA("DataModelMesh")
+    if mesh then
+        pcall(function() mesh.Scale=mesh.Scale*scale end)
+        pcall(function() mesh.TextureId="" end)
+    else
+        clone.Size=clone.Size*scale
+    end
+    pcall(function() clone.TextureID="" end)
+    pcall(function() clone.MaterialVariant="" end)
+    clone.CanCollide=false; clone.CanQuery=false; clone.CanTouch=false
+    clone.Massless=true; clone.CastShadow=false; clone.LocalTransparencyModifier=0
+    return clone
+end
+
+local function applyFlat(tool,state,color)
+    if not state.flat or not state.flat.Parent then
+        clearFlat(state)
+        local model=Instance.new("Model")
+        model.Name="VisualsV2_FlatChams_"..tool.Name
+        local entries={}
+        for _,source in ipairs(state.parts) do
+            local clone=not deformable(source) and shell(source,0.99) or nil
+            if clone then
+                clone.Anchored=false
+                clone.CFrame=source.CFrame
+                clone.Parent=model
+                local weld=Instance.new("WeldConstraint")
+                weld.Part0=clone; weld.Part1=source; weld.Parent=clone
+                entries[#entries+1]={source,clone}
+            end
+        end
+        model.Parent=workspace
+        local occluded=Instance.new("Highlight")
+        occluded.Name="VisualsV2_FlatChamsShell"
+        occluded.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
+        occluded.OutlineTransparency=1; occluded.FillTransparency=0
+        occluded.Adornee=model; occluded.Parent=model
+        local visible=Instance.new("Highlight")
+        visible.Name="VisualsV2_FlatChamsVisible"
+        visible.DepthMode=Enum.HighlightDepthMode.Occluded
+        visible.OutlineTransparency=1; visible.FillTransparency=0
+        visible.Adornee=tool; visible.Parent=model
+        state.flat,state.flatHighlight,state.visibleHighlight,state.flatEntries=model,occluded,visible,entries
+    end
+    state.flatHighlight.FillColor=color
+    state.visibleHighlight.FillColor=color
+    for _,entry in ipairs(state.flatEntries) do
+        local source,clone=entry[1],entry[2]
+        clone.Transparency=math.max(source.Transparency,source.LocalTransparencyModifier)>=1 and 1 or source.Transparency
+    end
+end
+
+local function applyChromatic(tool,state,color)
+    if not ensureViewport() then return end
+    if not state.chrom or not state.chrom.Parent then
+        clearChromatic(state)
+        local model=Instance.new("Model")
+        model.Name="VisualsV2_ChromaticChams_"..tool.Name
+        local entries={}
+        for _,source in ipairs(state.parts) do
+            local clone=not deformable(source) and shell(source,CHROM_SCALE) or nil
+            if clone then
+                clone.Anchored=true
+                clone.Material=Enum.Material.Foil
+                clone.Reflectance=0.12
+                clone.Transparency=math.max(source.Transparency,source.LocalTransparencyModifier)>=1 and 1 or CHROM_ALPHA
+                clone.Color=color
+                clone.CFrame=source.CFrame
+                clone.Parent=model
+                entries[#entries+1]={source,clone}
+            end
+        end
+        model.Parent=chromWorld
+        state.chrom,state.chromEntries,state.chromColor=model,entries,color
+    elseif state.chromColor~=color then
+        state.chromColor=color
+        for _,entry in ipairs(state.chromEntries) do entry[2].Color=color end
+    end
+end
+
+local function applyForceField(state)
+    for _,source in ipairs(state.parts) do
+        if state.materials[source]==nil then
+            local original=source.Material
+            local skinOriginal=source:GetAttribute("VisualsV2_OriginalMaterial")
+            if skinOriginal and Enum.Material[skinOriginal] then original=Enum.Material[skinOriginal] end
+            state.materials[source]=original
+        end
+        source.Material=Enum.Material.ForceField
+    end
+    for _,appearance in ipairs(state.appearances) do
+        if appearance.Parent and state.surfaces[appearance]==nil then
+            state.surfaces[appearance]=appearance.Parent
+            ownedSurfaces[appearance]=true
+            appearance.Parent=nil
+        end
+    end
+end
+
+local update
+local function queueUpdate()
+    if queued or resetting or not runtimeAlive then return end
+    queued=true
+    task.defer(function()
+        queued=false
+        if not resetting and runtimeAlive then update() end
+    end)
+end
+
+local function relevantChange(object)
+    if object:IsA("Tool") or object:IsA("BasePart") or object:IsA("DataModelMesh")
+        or object:IsA("Bone") or object:IsA("WrapLayer")
+        or (object:IsA("SurfaceAppearance") and not ownedSurfaces[object]) then
+        dirty=true
+        queueUpdate()
+    end
+end
+
+local function bindCharacter(character)
+    if trackedCharacter==character then return end
+    disconnectAll(characterConnections)
+    for tool,state in pairs(states) do clearState(state); states[tool]=nil end
+    trackedCharacter=character
+    dirty=true
+    if character then
+        characterConnections[1]=character.DescendantAdded:Connect(relevantChange)
+        characterConnections[2]=character.DescendantRemoving:Connect(relevantChange)
+    end
+end
+
+local function active()
+    for _,group in ipairs(groups) do if group.enabled then return true end end
+    return false
+end
+
+local function stopWatching()
+    if heartbeatConnection then heartbeatConnection:Disconnect(); heartbeatConnection=nil end
+    disconnectAll(lifecycleConnections)
+    disconnectAll(characterConnections)
+    trackedCharacter=nil
+    for tool,state in pairs(states) do clearState(state); states[tool]=nil end
+    destroyViewport()
+    dirty=true
+end
+
+update=function()
+    if resetting or not runtimeAlive then return end
+    if not active() then stopWatching(); return end
+    bindCharacter(player.Character~=removingCharacter and player.Character or nil)
+    if dirty then
+        dirty=false
+        for tool,state in pairs(states) do clearState(state); states[tool]=nil end
+        if trackedCharacter then
+            for _,tool in ipairs(trackedCharacter:GetChildren()) do
+                local group=groupFor(tool)
+                if group then
+                    local state={group=group,preset=group.preset,parts={},appearances={},materials={},surfaces={}}
+                    for _,object in ipairs(tool:GetDescendants()) do
+                        if object:IsA("BasePart") then state.parts[#state.parts+1]=object
+                        elseif object:IsA("SurfaceAppearance") then state.appearances[#state.appearances+1]=object end
+                    end
+                    states[tool]=state
+                end
+            end
+        end
+    end
+    local chromatic=false
+    for tool,state in pairs(states) do
+        if tool.Parent~=trackedCharacter or groupFor(tool)~=state.group then
+            clearState(state); states[tool]=nil
+        elseif #state.parts>0 then
+            local color=state.group.color()
+            if state.preset=="Flat" then applyFlat(tool,state,color)
+            elseif state.preset=="Chromatic" then
+                applyChromatic(tool,state,color)
+                chromatic=state.chrom~=nil or chromatic
+            else applyForceField(state) end
+        end
+    end
+    if not chromatic then destroyViewport() end
+end
+
+local function refresh()
+    if resetting or not runtimeAlive then return end
+    dirty=true
+    if active() and not heartbeatConnection then
+        lifecycleConnections[1]=player.CharacterAdded:Connect(function(character)
+            removingCharacter=nil
+            bindCharacter(character)
+            queueUpdate()
+            task.defer(function() if runtimeAlive then refreshHighlights() end end)
+        end)
+        lifecycleConnections[2]=player.CharacterRemoving:Connect(function(character)
+            removingCharacter=character or player.Character
+            bindCharacter(nil)
+            destroyViewport()
+        end)
+        local elapsed=0
+        heartbeatConnection=RunService.Heartbeat:Connect(function(dt)
+            elapsed+=math.max(tonumber(dt) or 0,0)
+            if elapsed>=0.1 then elapsed=0; update() end
+        end)
+    end
+    update()
+    refreshHighlights()
+end
+runtime.RefreshChams=refresh
+
+runtime.RegisterChamsFeature=function(section,key,label,matches,color)
+    local group={enabled=C(key.."Enabled",false),preset=presetName(C(key.."Preset","ForceField")),matches=matches,color=color}
+    groups[#groups+1]=group
+    group.toggle=addToggle(section,label.." Chams",group.enabled,function(value)
+        group.enabled=value
+        SetCfg(key.."Enabled",value)
+        refresh()
+    end)
+    group.dropdown=addDropdown(section,label.." Chams Preset",presets,group.preset,function(value)
+        group.preset=presetName(value)
+        SetCfg(key.."Preset",group.preset)
+        refresh()
+    end)
+    if group.enabled then refresh() end
+end
+
+runtime.RegisterReset(function()
+    resetting=true
+    for _,group in ipairs(groups) do
+        group.enabled=false
+        group.preset="ForceField"
+        group.toggle:Set(false)
+    end
+    stopWatching()
+    removingCharacter=nil
+    resetting=false
+end)
+end)()
+
+;(function()
+local section=mainTab:AddSection("Custom Knife/Gun","Visuals")
 local enabled=C("gunsVisualEnabled",false)
 local tintColor=C("gunsTintColor",Color3.fromRGB(38,38,38))
 local rainbow=C("gunsRainbow",false)
@@ -3667,6 +4069,7 @@ local function removeHighlight(tool)
 end
 local function applyTool(tool)
     if not enabled or not isGunKnife(tool) then return end
+    if env.VisualsV2Runtime.ChamsUsesOverlay(tool) then removeHighlight(tool); return end
     local h=tool:FindFirstChild(HIGHLIGHT_NAME)
     if not h then
         h=Instance.new("Highlight")
@@ -3733,6 +4136,10 @@ end)
 section:AddSlider("Rainbow Speed",1,10,rainbowSpeed,function(value)
     rainbowSpeed=math.clamp(tonumber(value) or 3,1,10); SetCfg("gunsRainbowSpeed",rainbowSpeed)
 end)
+
+section:AddParagraph("Weapon Chams","Applies to equipped local knives and guns. Chams reuse Highlight Color and Rainbow; ForceField preserves the original part colours.")
+env.VisualsV2Runtime.RegisterChamsFeature(section,"knifeChams","Knife",function(tool) return tool.Name:lower()=="knife" end,currentColor)
+env.VisualsV2Runtime.RegisterChamsFeature(section,"gunChams","Gun",function(tool) return tool.Name:lower()=="gun" end,currentColor)
 
 env.VisualsV2Runtime.RegisterReset(function()
     enabledToggle:Set(false); rainbowToggle:Set(false)
@@ -4005,7 +4412,7 @@ end)()
 -- =========================================================
 
 ;(function()
-local section=mainTab:AddSection("Tool Tint","Visuals")
+local section=mainTab:AddSection("Custom Tool","Visuals")
 section:AddParagraph("Tool Tint","Applies a configurable highlight tint to Roblox tools.")
 local enabled=C("toolTintEnabled",false)
 local tintColor=C("toolTintColor",Color3.fromRGB(38,38,38))
@@ -4043,6 +4450,7 @@ end
 
 local function apply(tool)
     if not enabled or not tool or not tool:IsA("Tool") then return end
+    if env.VisualsV2Runtime.ChamsUsesOverlay(tool) then removeHighlight(tool); return end
     if env.VisualsV2Runtime.GunsKnivesEnabled and isGunKnife(tool) then
         removeHighlight(tool)
         return
@@ -4108,6 +4516,9 @@ end)
 section:AddSlider("Tint Transparency",1,10,transparency,function(v)
     transparency=math.clamp(tonumber(v) or 5,1,10); SetCfg("toolTintTransparency",transparency); if enabled then applyAll() end
 end)
+
+section:AddParagraph("Tool Chams","Applies to equipped tools other than Gun and Knife. Chams reuse Tool Tint Color and Rainbow Tool Tint; ForceField preserves the original part colours.")
+env.VisualsV2Runtime.RegisterChamsFeature(section,"toolChams","Tool",function(tool) return not isGunKnife(tool) end,colorNow)
 
 env.VisualsV2Runtime.RegisterReset(function()
     enabledToggle:Set(false); rainbowToggle:Set(false)
@@ -6258,6 +6669,7 @@ creditsSection:AddLabel("b6o6s, A — 718910264942002277")
 creditsSection:AddLabel("Gato — 1333631679570645082")
 creditsSection:AddLabel("lzzzx, 187 — 586568393801596928")
 creditsSection:AddLabel("arkineku — 1418738338508308691")
+creditsSection:AddLabel("anya_bts — 1067515726677684324")
 end)()
 
 saveConfig()
