@@ -566,6 +566,941 @@ end)
 if enabled then task.defer(refresh) end
 end)()
 
+-- =========================================================
+-- COSMETIC: FE ANIMATIONS
+-- Complete FE animation presets from aux0on/FE, with Visuals V2 persistence.
+-- =========================================================
+;(function()
+local table_insert = table.insert
+
+local Maid = {}
+Maid.__index = Maid
+
+function Maid.new()
+    return setmetatable({_tasks = {}, _destroyed = false}, Maid)
+end
+
+function Maid:GiveTask(task)
+    if self._destroyed then
+        self:_cleanupTask(task)
+        return
+    end
+    table_insert(self._tasks, task)
+    return task
+end
+
+function Maid:GiveTasks(...)
+    for _, task in ipairs({...}) do
+        self:GiveTask(task)
+    end
+end
+
+function Maid:_cleanupTask(task)
+    local taskType = typeof(task)
+    if taskType == "RBXScriptConnection" then
+        task:Disconnect()
+    elseif taskType == "Instance" then
+        task:Destroy()
+    elseif taskType == "function" then
+        task()
+    elseif taskType == "table" and type(task.Destroy) == "function" then
+        task:Destroy()
+    end
+end
+
+function Maid:DoCleaning()
+    if self._destroyed then return end
+    self._destroyed = true
+    for _, task in ipairs(self._tasks) do
+        self:_cleanupTask(task)
+    end
+    self._tasks = {}
+end
+
+function Maid:Destroy()
+    self:DoCleaning()
+end
+
+local RootMaid = Maid.new()
+local alive = true
+local resetSection
+env.VisualsV2Runtime.RegisterReset(function()
+    if not runtimeAlive then
+        alive = false
+        RootMaid:DoCleaning()
+    elseif resetSection then
+        resetSection()
+    end
+end)
+
+-- Preserve the standalone add-on's loader-version check without leaving a
+-- second remote animation script or polling task running after re-execution.
+local loaderCheck = task.spawn(function()
+    local CoreGui = game:GetService("CoreGui")
+    local target
+    while alive and runtimeAlive and not target do
+        target = CoreGui:FindFirstChild("@bubbles.elia", true)
+        if not target then task.wait(0.1) end
+    end
+    if not alive or not runtimeAlive or not target or not target.Parent then return end
+    local version = target.Parent:FindFirstChild("Version", true)
+    while alive and runtimeAlive do
+        if version and (version.Text:find("v3.2", 1, true) or version.Text:find("v3.5", 1, true)) then
+            shared.kick("Malicious Loader Detected.\n\nUse the official script only available in discord.gg/overdrivehub")
+            break
+        end
+        task.wait(0.1)
+    end
+end)
+RootMaid:GiveTask(function() pcall(task.cancel, loaderCheck) end)
+
+local function isR15()
+    local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    if not alive or not runtimeAlive or not character then return false end
+    local humanoid = character:WaitForChild("Humanoid", 10)
+    return alive and runtimeAlive and humanoid and humanoid.RigType == Enum.HumanoidRigType.R15
+end
+if not isR15() then return end
+
+local feAnimSection = mainTab:AddSection("FE Animations", "Cosmetic")
+local FEAnimMaid = Maid.new()
+RootMaid:GiveTask(function() FEAnimMaid:DoCleaning() end)
+
+local animPresets = {
+            ["Default"] = nil,
+            ["OG Rthro Run"] = {run = "http://www.roblox.com/asset/?id=9801814462"},
+            ["Vampire"] = {
+                idle1 = "http://www.roblox.com/asset/?id=1083445855",
+                idle2 = "http://www.roblox.com/asset/?id=1083450166",
+                walk  = "http://www.roblox.com/asset/?id=1083473930",
+                run   = "http://www.roblox.com/asset/?id=1083462077",
+                jump  = "http://www.roblox.com/asset/?id=1083455352",
+                climb = "http://www.roblox.com/asset/?id=1083439238",
+                fall  = "http://www.roblox.com/asset/?id=1083443587"
+            },
+            ["Hero"] = {
+                idle1 = "http://www.roblox.com/asset/?id=616111295",
+                idle2 = "http://www.roblox.com/asset/?id=616113536",
+                walk  = "http://www.roblox.com/asset/?id=616122287",
+                run   = "http://www.roblox.com/asset/?id=616117076",
+                jump  = "http://www.roblox.com/asset/?id=616115533",
+                climb = "http://www.roblox.com/asset/?id=616104706",
+                fall  = "http://www.roblox.com/asset/?id=616108001"
+            },
+            ["Zombie Classic"] = {
+                idle1 = "http://www.roblox.com/asset/?id=616158929",
+                idle2 = "http://www.roblox.com/asset/?id=616160636",
+                walk  = "http://www.roblox.com/asset/?id=616168032",
+                run   = "http://www.roblox.com/asset/?id=616163682",
+                jump  = "http://www.roblox.com/asset/?id=616161997",
+                climb = "http://www.roblox.com/asset/?id=616156119",
+                fall  = "http://www.roblox.com/asset/?id=616157476"
+            },
+            ["Mage"] = {
+                idle1 = "http://www.roblox.com/asset/?id=707742142",
+                idle2 = "http://www.roblox.com/asset/?id=707855907",
+                walk  = "http://www.roblox.com/asset/?id=707897309",
+                run   = "http://www.roblox.com/asset/?id=707861613",
+                jump  = "http://www.roblox.com/asset/?id=707853694",
+                climb = "http://www.roblox.com/asset/?id=707826056",
+                fall  = "http://www.roblox.com/asset/?id=707829716"
+            },
+            ["Ghost"] = {
+                idle1 = "http://www.roblox.com/asset/?id=616006778",
+                idle2 = "http://www.roblox.com/asset/?id=616008087",
+                walk  = "http://www.roblox.com/asset/?id=616010382",
+                run   = "http://www.roblox.com/asset/?id=616013216",
+                jump  = "http://www.roblox.com/asset/?id=616008936",
+                climb = "http://www.roblox.com/asset/?id=616003713",
+                fall  = "http://www.roblox.com/asset/?id=616005863"
+            },
+            ["Elder"] = {
+                idle1 = "http://www.roblox.com/asset/?id=845397899",
+                idle2 = "http://www.roblox.com/asset/?id=845400520",
+                walk  = "http://www.roblox.com/asset/?id=845403856",
+                run   = "http://www.roblox.com/asset/?id=845386501",
+                jump  = "http://www.roblox.com/asset/?id=845398858",
+                climb = "http://www.roblox.com/asset/?id=845392038",
+                fall  = "http://www.roblox.com/asset/?id=845396048"
+            },
+            ["Levitation"] = {
+                idle1 = "http://www.roblox.com/asset/?id=616006778",
+                idle2 = "http://www.roblox.com/asset/?id=616008087",
+                walk  = "http://www.roblox.com/asset/?id=616013216",
+                run   = "http://www.roblox.com/asset/?id=616010382",
+                jump  = "http://www.roblox.com/asset/?id=616008936",
+                climb = "http://www.roblox.com/asset/?id=616003713",
+                fall  = "http://www.roblox.com/asset/?id=616005863"
+            },
+            ["Astronaut"] = {
+                idle1 = "http://www.roblox.com/asset/?id=891621366",
+                idle2 = "http://www.roblox.com/asset/?id=891633237",
+                walk  = "http://www.roblox.com/asset/?id=891667138",
+                run   = "http://www.roblox.com/asset/?id=891636393",
+                jump  = "http://www.roblox.com/asset/?id=891627522",
+                climb = "http://www.roblox.com/asset/?id=891609353",
+                fall  = "http://www.roblox.com/asset/?id=891617961"
+            },
+            ["Ninja"] = {
+                idle1 = "http://www.roblox.com/asset/?id=656117400",
+                idle2 = "http://www.roblox.com/asset/?id=656118341",
+                walk  = "http://www.roblox.com/asset/?id=656121766",
+                run   = "http://www.roblox.com/asset/?id=656118852",
+                jump  = "http://www.roblox.com/asset/?id=656117878",
+                climb = "http://www.roblox.com/asset/?id=656114359",
+                fall  = "http://www.roblox.com/asset/?id=656115606"
+            },
+            ["Werewolf"] = {
+                idle1 = "http://www.roblox.com/asset/?id=1083195517",
+                idle2 = "http://www.roblox.com/asset/?id=1083214717",
+                walk  = "http://www.roblox.com/asset/?id=1083178339",
+                run   = "http://www.roblox.com/asset/?id=1083216690",
+                jump  = "http://www.roblox.com/asset/?id=1083218792",
+                climb = "http://www.roblox.com/asset/?id=1083182000",
+                fall  = "http://www.roblox.com/asset/?id=1083189019"
+            },
+            ["Cartoon"] = {
+                idle1 = "http://www.roblox.com/asset/?id=742637544",
+                idle2 = "http://www.roblox.com/asset/?id=742638445",
+                walk  = "http://www.roblox.com/asset/?id=742640026",
+                run   = "http://www.roblox.com/asset/?id=742638842",
+                jump  = "http://www.roblox.com/asset/?id=742637942",
+                climb = "http://www.roblox.com/asset/?id=742636889",
+                fall  = "http://www.roblox.com/asset/?id=742637151"
+            },
+            ["Pirate"] = {
+                idle1 = "http://www.roblox.com/asset/?id=750781874",
+                idle2 = "http://www.roblox.com/asset/?id=750782770",
+                walk  = "http://www.roblox.com/asset/?id=750785693",
+                run   = "http://www.roblox.com/asset/?id=750783738",
+                jump  = "http://www.roblox.com/asset/?id=750782230",
+                climb = "http://www.roblox.com/asset/?id=750779899",
+                fall  = "http://www.roblox.com/asset/?id=750780242"
+            },
+            ["Sneaky"] = {
+                idle1 = "http://www.roblox.com/asset/?id=1132473842",
+                idle2 = "http://www.roblox.com/asset/?id=1132477671",
+                walk  = "http://www.roblox.com/asset/?id=1132510133",
+                run   = "http://www.roblox.com/asset/?id=1132494274",
+                jump  = "http://www.roblox.com/asset/?id=1132489853",
+                climb = "http://www.roblox.com/asset/?id=1132461372",
+                fall  = "http://www.roblox.com/asset/?id=1132469004"
+            },
+            ["Toy"] = {
+                idle1 = "http://www.roblox.com/asset/?id=782841498",
+                idle2 = "http://www.roblox.com/asset/?id=782845736",
+                walk  = "http://www.roblox.com/asset/?id=782843345",
+                run   = "http://www.roblox.com/asset/?id=782842708",
+                jump  = "http://www.roblox.com/asset/?id=782847020",
+                climb = "http://www.roblox.com/asset/?id=782843869",
+                fall  = "http://www.roblox.com/asset/?id=782846423"
+            },
+            ["Knight"] = {
+                idle1 = "http://www.roblox.com/asset/?id=657595757",
+                idle2 = "http://www.roblox.com/asset/?id=657568135",
+                walk  = "http://www.roblox.com/asset/?id=657552124",
+                run   = "http://www.roblox.com/asset/?id=657564596",
+                jump  = "http://www.roblox.com/asset/?id=658409194",
+                climb = "http://www.roblox.com/asset/?id=658360781",
+                fall  = "http://www.roblox.com/asset/?id=657600338"
+            },
+            ["Confident"] = {
+                idle1 = "http://www.roblox.com/asset/?id=1069977950",
+                idle2 = "http://www.roblox.com/asset/?id=1069987858",
+                walk  = "http://www.roblox.com/asset/?id=1070017263",
+                run   = "http://www.roblox.com/asset/?id=1070001516",
+                jump  = "http://www.roblox.com/asset/?id=1069984524",
+                climb = "http://www.roblox.com/asset/?id=1069946257",
+                fall  = "http://www.roblox.com/asset/?id=1069973677"
+            },
+            ["Popstar"] = {
+                idle1 = "http://www.roblox.com/asset/?id=1212900985",
+                idle2 = "http://www.roblox.com/asset/?id=1212900985",
+                walk  = "http://www.roblox.com/asset/?id=1212980338",
+                run   = "http://www.roblox.com/asset/?id=1212980348",
+                jump  = "http://www.roblox.com/asset/?id=1212954642",
+                climb = "http://www.roblox.com/asset/?id=1213044953",
+                fall  = "http://www.roblox.com/asset/?id=1212900995"
+            },
+            ["Princess"] = {
+                idle1 = "http://www.roblox.com/asset/?id=941003647",
+                idle2 = "http://www.roblox.com/asset/?id=941013098",
+                walk  = "http://www.roblox.com/asset/?id=941028902",
+                run   = "http://www.roblox.com/asset/?id=941015281",
+                jump  = "http://www.roblox.com/asset/?id=941008832",
+                climb = "http://www.roblox.com/asset/?id=940996062",
+                fall  = "http://www.roblox.com/asset/?id=941000007"
+            },
+            ["Cowboy"] = {
+                idle1 = "http://www.roblox.com/asset/?id=1014390418",
+                idle2 = "http://www.roblox.com/asset/?id=1014398616",
+                walk  = "http://www.roblox.com/asset/?id=1014421541",
+                run   = "http://www.roblox.com/asset/?id=1014401683",
+                jump  = "http://www.roblox.com/asset/?id=1014394726",
+                climb = "http://www.roblox.com/asset/?id=1014380606",
+                fall  = "http://www.roblox.com/asset/?id=1014384571"
+            },
+            ["Patrol"] = {
+                idle1 = "http://www.roblox.com/asset/?id=1149612882",
+                idle2 = "http://www.roblox.com/asset/?id=1150842221",
+                walk  = "http://www.roblox.com/asset/?id=1151231493",
+                run   = "http://www.roblox.com/asset/?id=1150967949",
+                jump  = "http://www.roblox.com/asset/?id=1150944216",
+                climb = "http://www.roblox.com/asset/?id=1148811837",
+                fall  = "http://www.roblox.com/asset/?id=1148863382"
+            },
+            ["Zombie FE"] = {
+                idle1 = "http://www.roblox.com/asset/?id=3489171152",
+                idle2 = "http://www.roblox.com/asset/?id=3489171152",
+                walk  = "http://www.roblox.com/asset/?id=3489174223",
+                run   = "http://www.roblox.com/asset/?id=3489173414",
+                jump  = "http://www.roblox.com/asset/?id=616161997",
+                climb = "http://www.roblox.com/asset/?id=616156119",
+                fall  = "http://www.roblox.com/asset/?id=616157476"
+            },
+            ["Catwalk Glam"] = {
+                idle1 = "http://www.roblox.com/asset/?id=133806214992291",
+                idle2 = "http://www.roblox.com/asset/?id=133806214992291",
+                walk  = "http://www.roblox.com/asset/?id=109168724482748",
+                run   = "http://www.roblox.com/asset/?id=81024476153754",
+                jump  = "http://www.roblox.com/asset/?id=116936326516985",
+                climb = "http://www.roblox.com/asset/?id=119377220967554",
+                fall  = "http://www.roblox.com/asset/?id=92294537340807"
+            },
+            ["Amazon Unboxed"] = {
+                idle1 = "http://www.roblox.com/asset/?id=98281136301627",
+                idle2 = "http://www.roblox.com/asset/?id=98281136301627",
+                walk  = "http://www.roblox.com/asset/?id=90478085024465",
+                run   = "http://www.roblox.com/asset/?id=134824450619865",
+                jump  = "http://www.roblox.com/asset/?id=121454505477205",
+                climb = "http://www.roblox.com/asset/?id=121145883950231",
+                fall  = "http://www.roblox.com/asset/?id=94788218468396"
+            },
+            ["Glow Motion"] = {
+                idle1 = "https://www.roblox.com/asset/?id=137764781910579",
+                idle2 = "https://www.roblox.com/asset/?id=137764781910579",
+                walk  = "http://www.roblox.com/asset/?id=85809016093530",
+                run   = "http://www.roblox.com/asset/?id=101925097435036",
+                jump  = "http://www.roblox.com/asset/?id=74159004634379",
+                climb = "http://www.roblox.com/asset/?id=108236155509584",
+                fall  = "https://www.roblox.com/asset/?id=98070939608691"
+            },
+            ["Bubbly"] = {
+                idle1 = "https://www.roblox.com/asset/?id=10921054344",
+                idle2 = "https://www.roblox.com/asset/?id=10921054344",
+                walk  = "http://www.roblox.com/asset/?id=10980888364",
+                run   = "http://www.roblox.com/asset/?id=10921057244",
+                jump  = "http://www.roblox.com/asset/?id=10921062673",
+                climb = "http://www.roblox.com/asset/?id=10921053544",
+                fall  = "https://www.roblox.com/asset/?id=10921061530"
+            },
+            ["Adidas Comm"] = {
+                idle1 = "https://www.roblox.com/asset/?id=122257458498464",
+                idle2 = "https://www.roblox.com/asset/?id=122257458498464",
+                walk  = "http://www.roblox.com/asset/?id=122150855457006",
+                run   = "http://www.roblox.com/asset/?id=82598234841035",
+                jump  = "http://www.roblox.com/asset/?id=75290611992385",
+                climb = "http://www.roblox.com/asset/?id=88763136693023",
+                fall  = "https://www.roblox.com/asset/?id=98600215928904"
+            },
+            ["KATSEYE"] = {
+                idle1 = "https://www.roblox.com/asset/?id=108187809145790",
+                idle2 = "https://www.roblox.com/asset/?id=108187809145790",
+                walk  = "http://www.roblox.com/asset/?id=99182913548783",
+                run   = "http://www.roblox.com/asset/?id=73117360545482",
+                jump  = "http://www.roblox.com/asset/?id=103632305262747",
+                climb = "http://www.roblox.com/asset/?id=106213237973858",
+                fall  = "https://www.roblox.com/asset/?id=127802717128367"
+            },
+            ["Wicked Popular"] = {
+                idle1 = "https://www.roblox.com/asset/?id=118832222982049",
+                idle2 = "https://www.roblox.com/asset/?id=118832222982049",
+                walk  = "http://www.roblox.com/asset/?id=92072849924640",
+                run   = "http://www.roblox.com/asset/?id=72301599441680",
+                jump  = "http://www.roblox.com/asset/?id=104325245285198",
+                climb = "http://www.roblox.com/asset/?id=131326830509784",
+                fall  = "https://www.roblox.com/asset/?id=121152442762481"
+            },
+            ["Dizzy"] = {
+                idle1 = "http://www.roblox.com/asset/?id=132806359718468",
+                idle2 = "http://www.roblox.com/asset/?id=132806359718468",
+                walk  = "http://www.roblox.com/asset/?id=110106034100313",
+                run   = "http://www.roblox.com/asset/?id=138305342272849",
+                jump  = "http://www.roblox.com/asset/?id=108564434408211",
+                climb = "http://www.roblox.com/asset/?id=93550710314258",
+                fall  = "http://www.roblox.com/asset/?id=138967706335414"
+            },
+            ["WDTL"] = {
+                idle1 = "http://www.roblox.com/asset/?id=92849173543269",
+                idle2 = "http://www.roblox.com/asset/?id=92849173543269",
+                walk  = "http://www.roblox.com/asset/?id=73718308412641",
+                run   = "http://www.roblox.com/asset/?id=135515454877967",
+                jump  = "http://www.roblox.com/asset/?id=78508480717326",
+                climb = "http://www.roblox.com/asset/?id=129447497744818",
+                fall  = "http://www.roblox.com/asset/?id=78147885297412"
+            },
+            ["Billie Eilish"] = {
+                idle1 = "http://www.roblox.com/asset/?id=102934602884410",
+                idle2 = "http://www.roblox.com/asset/?id=102934602884410",
+                walk  = "http://www.roblox.com/asset/?id=81877886552514",
+                run   = "http://www.roblox.com/asset/?id=100920560634123",
+                jump  = "http://www.roblox.com/asset/?id=117602630922781",
+                climb = "http://www.roblox.com/asset/?id=117873469361430",
+                fall  = "http://www.roblox.com/asset/?id=81072141180299"
+            },
+            ["Cute Bouncy"] = {
+                idle1 = "http://www.roblox.com/asset/?id=88464649697812",
+                idle2 = "http://www.roblox.com/asset/?id=88464649697812",
+                walk  = "http://www.roblox.com/asset/?id=98713727778027",
+                run   = "http://www.roblox.com/asset/?id=133955346539948",
+                jump  = "http://www.roblox.com/asset/?id=124147147418885",
+                climb = "http://www.roblox.com/asset/?id=95542189442725",
+                fall  = "http://www.roblox.com/asset/?id=128620818122982"
+            },
+            ["Cute"] = {
+                idle1 = "http://www.roblox.com/asset/?id=85735421117197",
+                idle2 = "http://www.roblox.com/asset/?id=85735421117197",
+                walk  = "http://www.roblox.com/asset/?id=140409718187215",
+                run   = "http://www.roblox.com/asset/?id=118375157537412",
+                jump  = "http://www.roblox.com/asset/?id=132381016103721",
+                climb = "http://www.roblox.com/asset/?id=86318575131600",
+                fall  = "http://www.roblox.com/asset/?id=77496925287217"
+            },
+            ["Jolly"] = {
+                idle1 = "http://www.roblox.com/asset/?id=136145727878709",
+                idle2 = "http://www.roblox.com/asset/?id=136145727878709",
+                walk  = "http://www.roblox.com/asset/?id=83277136078444",
+                run   = "http://www.roblox.com/asset/?id=124419804298310",
+                jump  = "http://www.roblox.com/asset/?id=122115816220842",
+                climb = "http://www.roblox.com/asset/?id=107190574095036",
+                fall  = "http://www.roblox.com/asset/?id=85263802503331"
+            },
+            ["Cute Kawaii"] = {
+                idle1 = "http://www.roblox.com/asset/?id=72311682331639",
+                idle2 = "http://www.roblox.com/asset/?id=72311682331639",
+                walk  = "http://www.roblox.com/asset/?id=107212872423561",
+                run   = "http://www.roblox.com/asset/?id=118582510545072",
+                jump  = "http://www.roblox.com/asset/?id=112952548321695",
+                climb = "http://www.roblox.com/asset/?id=126383408493776",
+                fall  = "http://www.roblox.com/asset/?id=83307333809322"
+            },
+            ["Doll 3.0"] = {
+                idle1 = "http://www.roblox.com/asset/?id=83032187271383",
+                idle2 = "http://www.roblox.com/asset/?id=83032187271383",
+                walk  = "http://www.roblox.com/asset/?id=78434960966537",
+                run   = "http://www.roblox.com/asset/?id=129768396663808",
+                jump  = "http://www.roblox.com/asset/?id=75369057994828",
+                climb = "http://www.roblox.com/asset/?id=112371892133970",
+                fall  = "http://www.roblox.com/asset/?id=81027444073311"
+            },
+            ["Victoria Model"] = {
+                idle1 = "http://www.roblox.com/asset/?id=132069965396465",
+                idle2 = "http://www.roblox.com/asset/?id=132069965396465",
+                walk  = "http://www.roblox.com/asset/?id=84814915379579",
+                run   = "http://www.roblox.com/asset/?id=84814915379579",
+                jump  = "http://www.roblox.com/asset/?id=78163261581163",
+                climb = "http://www.roblox.com/asset/?id=87772134905508",
+                fall  = "http://www.roblox.com/asset/?id=110073924253388"
+            },
+            ["Bike/Bicyclist"] = {
+                idle1 = "http://www.roblox.com/asset/?id=126390120399173",
+                idle2 = "http://www.roblox.com/asset/?id=136791517336633",
+                walk  = "http://www.roblox.com/asset/?id=98707881660541",
+                run   = "http://www.roblox.com/asset/?id=102775737211919",
+                jump  = "http://www.roblox.com/asset/?id=129144847881258",
+                climb = "http://www.roblox.com/asset/?id=88267082364595",
+                fall  = "http://www.roblox.com/asset/?id=110684787086498"
+            },
+            ["Animal"] = {
+                idle1 = "http://www.roblox.com/asset/?id=128838183008466",
+                idle2 = "http://www.roblox.com/asset/?id=99689776099970",
+                walk  = "http://www.roblox.com/asset/?id=112238064449133",
+                run   = "http://www.roblox.com/asset/?id=97412731442167",
+                jump  = "http://www.roblox.com/asset/?id=123565665274439",
+                climb = "http://www.roblox.com/asset/?id=75085836535654",
+                fall  = "http://www.roblox.com/asset/?id=124705831982259"
+            },
+            ["It-Girl Essential Model"] = {
+                idle1 = "http://www.roblox.com/asset/?id=132232079260125",
+                idle2 = "http://www.roblox.com/asset/?id=102440789796215",
+                walk  = "http://www.roblox.com/asset/?id=86579666661215",
+                run   = "http://www.roblox.com/asset/?id=83336349930143",
+                jump  = "http://www.roblox.com/asset/?id=103382156539106",
+                climb = "http://www.roblox.com/asset/?id=77385815954046",
+                fall  = "http://www.roblox.com/asset/?id=127262648208409"
+            },
+            ["Oldschool"] = {
+                idle1 = "http://www.roblox.com/asset/?id=10921230744",
+                idle2 = "http://www.roblox.com/asset/?id=10921232093",
+                walk  = "http://www.roblox.com/asset/?id=10921244891",
+                run   = "http://www.roblox.com/asset/?id=10921240218",
+                jump  = "http://www.roblox.com/asset/?id=10921242013",
+                climb = "http://www.roblox.com/asset/?id=10921229866",
+                fall  = "http://www.roblox.com/asset/?id=10921241244"
+            },
+            ["Spider"] = {
+                idle1 = "http://www.roblox.com/asset/?id=112316814377814",
+                idle2 = "http://www.roblox.com/asset/?id=103439018552145",
+                walk  = "http://www.roblox.com/asset/?id=109976439277879",
+                run   = "http://www.roblox.com/asset/?id=119985832593347",
+                jump  = "http://www.roblox.com/asset/?id=87979233462906",
+                climb = "http://www.roblox.com/asset/?id=119278342251995",
+                fall  = "http://www.roblox.com/asset/?id=71112238570777"
+            },
+            ["Joy"] = {
+                idle1 = "http://www.roblox.com/asset/?id=119957475250242",
+                idle2 = "http://www.roblox.com/asset/?id=101200477339169",
+                walk  = "http://www.roblox.com/asset/?id=112597572150963",
+                run   = "http://www.roblox.com/asset/?id=96521659811743",
+                jump  = "http://www.roblox.com/asset/?id=82500357520736",
+                climb = "http://www.roblox.com/asset/?id=110061716873830",
+                fall  = "http://www.roblox.com/asset/?id=132095139090357"
+            },
+            ["Flying Aura"] = {
+                idle1 = "http://www.roblox.com/asset/?id=122426844584505",
+                idle2 = "http://www.roblox.com/asset/?id=122426844584505",
+                walk  = "http://www.roblox.com/asset/?id=83077254246622",
+                run   = "http://www.roblox.com/asset/?id=77053251062908",
+                jump  = "http://www.roblox.com/asset/?id=125422018244301",
+                climb = "http://www.roblox.com/asset/?id=95973965948476",
+                fall  = "http://www.roblox.com/asset/?id=109790195947848"
+            },
+                        
+            ["FHA V2"] = {
+                idle1 = "http://www.roblox.com/asset/?id=77320840005481",
+                idle2 = "http://www.roblox.com/asset/?id=77320840005481",
+                walk  = "http://www.roblox.com/asset/?id=134493251445479",
+                run   = "http://www.roblox.com/asset/?id=122214533401932",
+                jump  = "http://www.roblox.com/asset/?id=80078165493816",
+                climb = "http://www.roblox.com/asset/?id=114562994724647",
+                fall  = "http://www.roblox.com/asset/?id=98383265864436"
+            },
+           
+            ["Silent Nurse"] = {
+                idle1 = "http://www.roblox.com/asset/?id=111047244862844",
+                idle2 = "http://www.roblox.com/asset/?id=111047244862844",
+                walk  = "http://www.roblox.com/asset/?id=94196382152901",
+                run   = "http://www.roblox.com/asset/?id=94196382152901",
+                jump  = "http://www.roblox.com/asset/?id=106098057235980",
+                climb = "http://www.roblox.com/asset/?id=108985375609705",
+                fall  = "http://www.roblox.com/asset/?id=131579609334755"
+            },
+
+            ["Supermodel"] = {
+                idle1 = "http://www.roblox.com/asset/?id=91917730726110",
+                idle2 = "http://www.roblox.com/asset/?id=91917730726110",
+                walk  = "http://www.roblox.com/asset/?id=90320132970213",
+                run   = "http://www.roblox.com/asset/?id=112051258179255",
+                jump  = "http://www.roblox.com/asset/?id=91931403363860",
+                climb = "http://www.roblox.com/asset/?id=82728029306069",
+                fall  = "http://www.roblox.com/asset/?id=119173466228299"
+            },
+            
+            ["Enchanted Fairy"] = {
+                idle1 = "http://www.roblox.com/asset/?id=73650178233095",
+                idle2 = "http://www.roblox.com/asset/?id=73650178233095",
+                walk  = "http://www.roblox.com/asset/?id=94547195663763",
+                run   = "http://www.roblox.com/asset/?id=76909584337943",
+                jump  = "http://www.roblox.com/asset/?id=120533712803667",
+                climb = "http://www.roblox.com/asset/?id=140663406485180",
+                fall  = "http://www.roblox.com/asset/?id=100947971756348"
+            },
+            
+            ["Furry"] = {
+                idle1 = "http://www.roblox.com/asset/?id=111821292044705",
+                idle2 = "http://www.roblox.com/asset/?id=111821292044705",
+                walk  = "http://www.roblox.com/asset/?id=104011441852459",
+                run   = "http://www.roblox.com/asset/?id=87770060317862",
+                jump  = "http://www.roblox.com/asset/?id=102635582722041",
+                climb = "http://www.roblox.com/asset/?id=76660530164497",
+                fall  = "http://www.roblox.com/asset/?id=137079985547592"
+            },
+            
+            ["Vlada Model"] = {
+                idle1 = "http://www.roblox.com/asset/?id=100139116433530",
+                idle2 = "http://www.roblox.com/asset/?id=100139116433530",
+                walk  = "http://www.roblox.com/asset/?id=77983757225444",
+                run   = "http://www.roblox.com/asset/?id=116717848244930",
+                jump  = "http://www.roblox.com/asset/?id=120751055172567",
+                climb = "http://www.roblox.com/asset/?id=70966616077778",
+                fall  = "http://www.roblox.com/asset/?id=136118518255777"
+            },
+            ["R6 Converter"] = {
+                idle1 = "http://www.roblox.com/asset/?id=90040240627854",
+                idle2 = "http://www.roblox.com/asset/?id=90040240627854",
+                walk  = "http://www.roblox.com/asset/?id=92149852708428",
+                run   = "http://www.roblox.com/asset/?id=72259383092959",
+                jump  = "http://www.roblox.com/asset/?id=130519980521511",
+                climb = "http://www.roblox.com/asset/?id=80369171706383",
+                fall  = "http://www.roblox.com/asset/?id=130011792193300"
+            },
+        }
+
+local animMap = {
+            idle  = { folder = "idle",  slots = { { child = "Animation1", origKey = "idle1" }, { child = "Animation2", origKey = "idle2" } } },
+            walk  = { folder = "walk",  slots = { { child = "WalkAnim",   origKey = "walk"  } } },
+            run   = { folder = "run",   slots = { { child = "RunAnim",    origKey = "run"   } } },
+            jump  = { folder = "jump",  slots = { { child = "JumpAnim",   origKey = "jump"  } } },
+            climb = { folder = "climb", slots = { { child = "ClimbAnim",  origKey = "climb" } } },
+            fall  = { folder = "fall",  slots = { { child = "FallAnim",   origKey = "fall"  } } },
+        }
+
+local allAnimOptions = {
+            "Default", "Vampire", "Hero", "Zombie Classic", "Mage", "Ghost",
+            "Elder", "Levitation", "Astronaut", "Ninja", "Werewolf", "Cartoon",
+            "Pirate", "Sneaky", "Toy", "Knight", "Confident", "Popstar",
+            "Princess", "Cowboy", "Patrol", "Zombie FE", "Catwalk Glam", "Amazon Unboxed",
+            "Glow Motion", "Bubbly", "Adidas Comm", "KATSEYE", "Wicked Popular",
+            "Dizzy", "WDTL", "Billie Eilish", "Cute Bouncy", "Cute",
+            "Jolly", "Cute Kawaii", "Doll 3.0", "Victoria Model",
+            "Bike/Bicyclist", "Animal", "It-Girl Essential Model",
+            "Oldschool", "Spider", "Joy", "Flying Aura", "FHA V2", "Silent Nurse", "Supermodel", "Enchanted Fairy", "Furry", "Vlada Model", "R6 Converter"
+        }
+
+        local runAnimOptions = {
+            "Default", "OG Rthro Run", "Vampire", "Hero", "Zombie Classic", "Mage", "Ghost",
+            "Elder", "Levitation", "Astronaut", "Ninja", "Werewolf", "Cartoon",
+            "Pirate", "Sneaky", "Toy", "Knight", "Confident", "Popstar",
+            "Princess", "Cowboy", "Patrol", "Zombie FE", "Catwalk Glam", "Amazon Unboxed",
+            "Glow Motion", "Bubbly", "Adidas Comm", "KATSEYE", "Wicked Popular",
+            "Dizzy", "WDTL", "Billie Eilish", "Cute Bouncy", "Cute",
+            "Jolly", "Cute Kawaii", "Doll 3.0", "Victoria Model",
+            "Bike/Bicyclist", "Animal", "It-Girl Essential Model",
+            "Oldschool", "Spider", "Joy", "Flying Aura", "FHA V2", "Silent Nurse", "Supermodel", "Enchanted Fairy", "Furry", "Vlada Model", "R6 Converter"
+        }
+
+table.insert(allAnimOptions, "Custom")
+table.insert(runAnimOptions, "Custom")
+
+local presetKeys = {
+    all = "feAnimPresetAll", idle = "feAnimPresetIdle", walk = "feAnimPresetWalk",
+    run = "feAnimPresetRun", jump = "feAnimPresetJump", climb = "feAnimPresetClimb",
+    fall = "feAnimPresetFall",
+}
+local customSlots = {
+    {key = "idle1", label = "Idle 1", config = "feAnimCustomIdle1"},
+    {key = "idle2", label = "Idle 2", config = "feAnimCustomIdle2"},
+    {key = "walk", label = "Walk", config = "feAnimCustomWalk"},
+    {key = "run", label = "Run", config = "feAnimCustomRun"},
+    {key = "jump", label = "Jump", config = "feAnimCustomJump"},
+    {key = "climb", label = "Climb", config = "feAnimCustomClimb"},
+    {key = "fall", label = "Fall", config = "feAnimCustomFall"},
+}
+
+local function cleanAnimationId(value)
+    local text = tostring(value or ""):match("^%s*(.-)%s*$")
+    if text == "" then return "" end
+    local id = text:match("^(%d+)$") or text:match("^rbxassetid://(%d+)$")
+        or text:match("^https?://[^/]*roblox%.com/.*[?&]id=(%d+)")
+    if not id then return nil end
+    id = id:gsub("^0+", "")
+    return id
+end
+
+local feAnimEnabled = C("feAnimEnabled", false) == true
+local animState, customAnims = {}, {}
+for animType, key in pairs(presetKeys) do
+    local selected = C(key, "Default")
+    if selected ~= "Default" and selected ~= "Custom" and not animPresets[selected] then
+        selected = "Default"
+    elseif selected == "OG Rthro Run" and animType ~= "run" then
+        selected = "Default"
+    end
+    animState[animType] = selected
+end
+for _, slot in ipairs(customSlots) do
+    customAnims[slot.key] = cleanAnimationId(C(slot.config, "")) or ""
+end
+
+local originalAnims = {}
+local originalCharacter
+local originalsByCharacter = setmetatable({}, {__mode = "k"})
+local spawnToken = 0
+local updateSerial = 0
+local applyRunning = false
+local applyingScripts = {}
+
+local function isCurrentSpawn(character, token)
+    return alive and runtimeAlive and feAnimEnabled and token == spawnToken
+        and LocalPlayer.Character == character and character.Parent ~= nil
+end
+
+-- Wait for every Animate folder and populated asset ID before recording
+-- defaults. Selections can be restored before a character finishes loading.
+local function waitForAnimateReady(character, token, timeout)
+    local started = os.clock()
+    local function remaining() return math.max(timeout - (os.clock() - started), 0) end
+    local Animate = character:WaitForChild("Animate", remaining())
+    if not Animate or not isCurrentSpawn(character, token) then return nil end
+    for _, info in pairs(animMap) do
+        local folder = Animate:WaitForChild(info.folder, remaining())
+        if not folder or not isCurrentSpawn(character, token) then return nil end
+        for _, slot in ipairs(info.slots) do
+            local anim = folder:WaitForChild(slot.child, remaining())
+            if not anim or not isCurrentSpawn(character, token) then return nil end
+            while anim.AnimationId == "" and remaining() > 0 do
+                task.wait(0.05)
+                if not isCurrentSpawn(character, token) then return nil end
+            end
+            if anim.AnimationId == "" then return nil end
+        end
+    end
+    return Animate
+end
+
+local function saveOriginalAnimations(character)
+    local cached = originalsByCharacter[character]
+    if cached then
+        originalCharacter, originalAnims = character, cached
+        return true
+    end
+    local Animate = character:FindFirstChild("Animate")
+    if not Animate then return false end
+    local originals = {}
+    for _, info in pairs(animMap) do
+        local folder = Animate:FindFirstChild(info.folder)
+        if not folder then return false end
+        for _, slot in ipairs(info.slots) do
+            local anim = folder:FindFirstChild(slot.child)
+            if not anim or anim.AnimationId == "" then return false end
+            originals[slot.origKey] = anim.AnimationId
+        end
+    end
+    originalsByCharacter[character] = originals
+    originalCharacter, originalAnims = character, originals
+    return true
+end
+
+local function stopAllAnimations(character)
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+    for _, track in pairs(humanoid:GetPlayingAnimationTracks()) do
+        track:Stop(0)
+    end
+end
+
+local function releaseAnimationScripts()
+    for Animate in pairs(applyingScripts) do
+        applyingScripts[Animate] = nil
+        pcall(function() Animate.Disabled = false end)
+    end
+end
+
+local function restoreDefaultAnimations(character)
+    character = character or LocalPlayer.Character
+    local originals = character and originalsByCharacter[character]
+    local Animate = character and character:FindFirstChild("Animate")
+    if not originals or not Animate then return end
+    stopAllAnimations(character)
+    Animate.Disabled = true
+    for _, info in pairs(animMap) do
+        local folder = Animate:FindFirstChild(info.folder)
+        if folder then
+            for _, slot in ipairs(info.slots) do
+                local anim = folder:FindFirstChild(slot.child)
+                if anim and originals[slot.origKey] then
+                    anim.AnimationId = originals[slot.origKey]
+                end
+            end
+        end
+    end
+    Animate.Disabled = false
+end
+
+local function getPresetForType(animType)
+    if animState[animType] ~= "Default" then return animState[animType] end
+    if animState.all ~= "Default" then return animState.all end
+    return "Default"
+end
+
+-- Coalesce startup dropdown restoration and quick edits into one worker.
+-- A stopped execution cannot overwrite animations applied by its replacement.
+local function applyAnimations()
+    if not alive or not runtimeAlive or not feAnimEnabled then return end
+    if LocalPlayer.Character ~= originalCharacter then return end
+    updateSerial = updateSerial + 1
+    if applyRunning then return end
+    applyRunning = true
+    task.spawn(function()
+        while alive and runtimeAlive and feAnimEnabled do
+            local character = LocalPlayer.Character
+            if character ~= originalCharacter then break end
+            local Animate = character and character:FindFirstChild("Animate")
+            if not Animate then break end
+            local serial, token = updateSerial, spawnToken
+            local ownership = {}
+            stopAllAnimations(character)
+            Animate.Disabled = true
+            applyingScripts[Animate] = ownership
+            task.wait(0.1)
+            if applyingScripts[Animate] == ownership then
+                if isCurrentSpawn(character, token) and serial == updateSerial then
+                    local humanoid = character:FindFirstChildOfClass("Humanoid")
+                    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+                    for animType, info in pairs(animMap) do
+                        local presetName = getPresetForType(animType)
+                        local preset = animPresets[presetName]
+                        local folder = Animate:FindFirstChild(info.folder)
+                        if folder then
+                            for _, slot in ipairs(info.slots) do
+                                local anim = folder:FindFirstChild(slot.child)
+                                local newId = originalAnims[slot.origKey]
+                                if presetName == "Custom" then
+                                    local customId = customAnims[slot.origKey]
+                                    if customId and customId ~= "" then
+                                        newId = "rbxassetid://" .. customId
+                                    end
+                                elseif preset and preset[slot.origKey] then
+                                    newId = preset[slot.origKey]
+                                end
+                                if anim and newId then
+                                    anim.AnimationId = newId
+                                    if (animType == "jump" or animType == "fall") and animator then
+                                        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                                            if track.Animation and track.Animation.AnimationId == newId then
+                                                track:Stop(0)
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                Animate.Disabled = false
+                applyingScripts[Animate] = nil
+            end
+            if serial == updateSerial then break end
+        end
+        applyRunning = false
+    end)
+end
+
+local function applyOnSpawn(character, token)
+    local humanoid = character:WaitForChild("Humanoid", 10)
+    if not humanoid or humanoid.RigType ~= Enum.HumanoidRigType.R15
+        or not isCurrentSpawn(character, token) then return end
+    if not waitForAnimateReady(character, token, 10) then return end
+    if not isCurrentSpawn(character, token) or not saveOriginalAnimations(character) then return end
+    applyAnimations()
+    task.wait(0.5)
+    if isCurrentSpawn(character, token) then applyAnimations() end
+end
+
+local function queueCharacter(character)
+    spawnToken = spawnToken + 1
+    updateSerial = updateSerial + 1
+    local token = spawnToken
+    releaseAnimationScripts()
+    originalCharacter, originalAnims = nil, {}
+    task.spawn(applyOnSpawn, character, token)
+end
+
+local function enableFEAnims()
+    FEAnimMaid:DoCleaning()
+    FEAnimMaid = Maid.new()
+    FEAnimMaid:GiveTask(LocalPlayer.CharacterAdded:Connect(queueCharacter))
+    FEAnimMaid:GiveTask(LocalPlayer.CharacterRemoving:Connect(function(character)
+        spawnToken = spawnToken + 1
+        updateSerial = updateSerial + 1
+        releaseAnimationScripts()
+        restoreDefaultAnimations(character)
+        originalCharacter, originalAnims = nil, {}
+    end))
+    if LocalPlayer.Character then queueCharacter(LocalPlayer.Character) end
+end
+
+local function disableFEAnims()
+    spawnToken = spawnToken + 1
+    updateSerial = updateSerial + 1
+    FEAnimMaid:DoCleaning()
+    FEAnimMaid = Maid.new()
+    releaseAnimationScripts()
+    restoreDefaultAnimations()
+    -- Keep presets and custom IDs when toggled off so re-execution restores them.
+end
+
+local feAnimToggle = addToggle(feAnimSection, "Enable FE Anims", feAnimEnabled, function(enabled)
+    if not alive or not runtimeAlive then return end
+    feAnimEnabled = enabled
+    SetCfg("feAnimEnabled", enabled)
+    if enabled then enableFEAnims() else disableFEAnims() end
+end)
+
+local presetControllers = {}
+local function addAnimationDropdown(label, animType, options)
+    presetControllers[animType] = addDropdown(feAnimSection, label, options, animState[animType], function(selected)
+        if not alive or not runtimeAlive then return end
+        if selected ~= "Default" and selected ~= "Custom" and not animPresets[selected] then return end
+        if selected == "OG Rthro Run" and animType ~= "run" then return end
+        animState[animType] = selected
+        SetCfg(presetKeys[animType], selected)
+        applyAnimations()
+    end)
+end
+addAnimationDropdown("All Animations", "all", allAnimOptions)
+local dropdowns = {
+    {label = "Idle Animation", key = "idle"},
+    {label = "Walk Animation", key = "walk"},
+    {label = "Run Animation", key = "run"},
+    {label = "Jump Animation", key = "jump"},
+    {label = "Climb Animation", key = "climb"},
+    {label = "Fall Animation", key = "fall"},
+}
+for _, dd in ipairs(dropdowns) do
+    addAnimationDropdown(dd.label, dd.key, dd.key == "run" and runAnimOptions or allAnimOptions)
+end
+
+feAnimSection:AddLabel("Select Custom to use your saved animation IDs.")
+local function customIdDescription()
+    local lines = {}
+    for _, slot in ipairs(customSlots) do
+        local id = customAnims[slot.key]
+        table.insert(lines, slot.label .. ": " .. (id ~= "" and id or "Not set"))
+    end
+    return table.concat(lines, "\n")
+end
+local savedCustomIds = feAnimSection:AddParagraph("Saved Custom Animation IDs", customIdDescription(), true)
+local function refreshCustomIdDescription()
+    if savedCustomIds and type(savedCustomIds.SetValue) == "function" then
+        savedCustomIds:SetValue(customIdDescription())
+    end
+end
+for _, slot in ipairs(customSlots) do
+    feAnimSection:AddTextBox("Custom " .. slot.label .. " Animation ID", function(value)
+        if not alive or not runtimeAlive then return end
+        local id = cleanAnimationId(value)
+        if id == nil then
+            shared.Notify("Error: Enter an animation ID or asset URL. Leave it empty to clear it.", 0)
+            return
+        end
+        customAnims[slot.key] = id
+        SetCfg(slot.config, id)
+        refreshCustomIdDescription()
+        applyAnimations()
+    end)
+end
+
+resetSection = function()
+    feAnimToggle:Set(false)
+    feAnimEnabled = false
+    disableFEAnims()
+    for animType in pairs(presetKeys) do
+        animState[animType] = "Default"
+        local control = presetControllers[animType]
+        if control and type(control.Select) == "function" then
+            pcall(function() control:Select("Default") end)
+        end
+    end
+    for _, slot in ipairs(customSlots) do customAnims[slot.key] = "" end
+    refreshCustomIdDescription()
+end
+RootMaid:GiveTask(function()
+    feAnimEnabled = false
+    disableFEAnims()
+end)
+end)()
+
 -- COSMETIC: TRAIL
 -- =========================================================
 
@@ -4931,7 +5866,8 @@ local timerEnabled=C("fireflyTimerEnabled",true)
 local timerColors=C("fireflyTimerColors",true)
 local timerSize=math.clamp(tonumber(C("fireflyTimerSize",10)) or 10,1,10)
 local timerLocked=C("fireflyTimerLocked",false)
-local COUNTDOWN=2.5
+-- The supplied recording releases the lid about 3s after activation.
+local COUNTDOWN=3.0
 local COOLDOWN=16
 local TRIGGER_POINT=0.24
 local JUMP_GAP=0.40
@@ -4956,6 +5892,7 @@ local watchConnections={}
 local hookedTools=setmetatable({}, {__mode="k"})
 local scanToken=0
 local isOnCooldown=false
+local cooldownGateReady=false
 local jumpTriggered=false
 local cycleToken=0
 local cycleStartedAt=nil
@@ -4986,6 +5923,34 @@ end
 
 local function disconnect(conn)
     if conn then pcall(function() conn:Disconnect() end) end
+end
+
+local function ownsFireflyTool(tool)
+    local backpack=player:FindFirstChildOfClass("Backpack")
+    return (player.Character and tool.Parent==player.Character)
+        or (backpack and tool.Parent==backpack) or false
+end
+
+local function blockToolActivation(tool,state)
+    if not autoClutch or not isOnCooldown or not cooldownGateReady or not ownsFireflyTool(tool) then return end
+    state.blocked=true
+    if tool.Enabled then pcall(function() tool.Enabled=false end) end
+end
+
+local function blockFireflyTools()
+    for tool,state in pairs(hookedTools) do blockToolActivation(tool,state) end
+end
+
+local function releaseToolBlocks()
+    cooldownGateReady=false
+    for tool,state in pairs(hookedTools) do
+        if state.blocked then
+            state.blocked=false
+            pcall(function()
+                if not tool.Enabled then tool.Enabled=state.originalEnabled end
+            end)
+        end
+    end
 end
 
 local function clearTimerGuis()
@@ -5074,8 +6039,7 @@ local function fireJump()
 end
 
 local function startTwoJumpSequence(myCycle)
-    -- Debug addon behavior: first jump near the end of the 2.5s countdown,
-    -- then a second jump 0.40 seconds later.
+    -- Jump shortly before the jar releases its lid, then again 0.40s later.
     fireJump()
     task.delay(JUMP_GAP,function()
         if autoClutch and myCycle==cycleToken then
@@ -5093,6 +6057,7 @@ local function stopCycle()
     blockConnection=nil
     cycleToken+=1
     isOnCooldown=false
+    releaseToolBlocks()
     jumpTriggered=false
     cycleStartedAt=nil
     countdownRemaining=nil
@@ -5100,8 +6065,8 @@ local function stopCycle()
     updateTimerDisplay()
 end
 
--- Match the Debug reference's Heartbeat countdown and jump threshold. The
--- displayed countdown uses the same remaining time that triggers the first jump.
+-- Keep the displayed countdown and first-jump trigger on the same Heartbeat
+-- clock. The release duration matches the supplied in-game recording.
 local function startCountdown()
     if not autoClutch then return end
     buildTimer()
@@ -5148,13 +6113,25 @@ end
 
 local function startBlockTimer()
     isOnCooldown=true
+    local myCycle=cycleToken
+    -- Let the accepted activation reach the game's own handlers before locking
+    -- the Tool. The lock prevents subsequent clicks from replaying its animation.
+    task.defer(function()
+        if autoClutch and isOnCooldown and myCycle==cycleToken then
+            cooldownGateReady=true
+            blockFireflyTools()
+        end
+    end)
     disconnect(blockConnection)
     blockConnection=nil
     blockConnection=RunService.Heartbeat:Connect(function()
         if cooldownEndsAt and os.clock()>=cooldownEndsAt then
             isOnCooldown=false
+            releaseToolBlocks()
             disconnect(blockConnection)
             blockConnection=nil
+        elseif cooldownGateReady then
+            blockFireflyTools()
         end
     end)
 end
@@ -5173,15 +6150,30 @@ end
 
 local function connectToTool(tool)
     if not tool or not tool:IsA("Tool") or tool.Name~="Fireflies" then return end
-    if hookedTools[tool] then return end
+    if hookedTools[tool] then
+        blockToolActivation(tool,hookedTools[tool])
+        return
+    end
 
-    hookedTools[tool]=true
+    local state={originalEnabled=tool.Enabled,blocked=false}
+    hookedTools[tool]=state
+    table.insert(watchConnections,tool:GetPropertyChangedSignal("Enabled"):Connect(function()
+        if autoClutch and isOnCooldown then
+            if tool.Enabled then state.originalEnabled=true end
+            blockToolActivation(tool,state)
+        elseif not state.blocked then
+            state.originalEnabled=tool.Enabled
+        end
+    end))
     table.insert(watchConnections,tool.Activated:Connect(function()
         if not autoClutch or isOnCooldown then return end
-        local backpack=player:FindFirstChildOfClass("Backpack")
-        if tool.Parent~=player.Character and tool.Parent~=backpack then return end
+        if not ownsFireflyTool(tool) then return end
+        -- Activated was accepted while Enabled was true, even if the game's
+        -- earlier handler has already disabled it for its own cooldown.
+        state.originalEnabled=true
         startOriginalCycle()
     end))
+    blockToolActivation(tool,state)
 end
 
 local function scanForFireflies()
@@ -5254,28 +6246,13 @@ end
 
 local function unhookTool()
     scanToken+=1
+    stopCycle()
 
     for _,conn in ipairs(watchConnections) do
         disconnect(conn)
     end
     table.clear(watchConnections)
     table.clear(hookedTools)
-
-    disconnect(countdownConnection)
-    countdownConnection=nil
-    disconnect(cooldownConnection)
-    cooldownConnection=nil
-    disconnect(blockConnection)
-    blockConnection=nil
-
-    cycleToken+=1
-    isOnCooldown=false
-    jumpTriggered=false
-    cycleStartedAt=nil
-    countdownRemaining=nil
-    cooldownEndsAt=nil
-
-    updateTimerDisplay()
 end
 
 local autoToggle=addToggle(section,"Auto Firefly Clutch",autoClutch,function(state)
@@ -5761,8 +6738,12 @@ local removingCharacter=nil
 local recoveryDeadline=0
 local rescanRequested=false
 local toyAttempts={}
+local activeToyRequest=nil
+local toyOrderDirty=true
+local orderingBackpack=false
 local observedBackpack=nil
 local backpackConnections={}
+local characterConnections={}
 local toyConnections={}
 local guiConnections={}
 local lifecycleConnections={}
@@ -5864,11 +6845,75 @@ local function toyRemote()
     if remote and remote:IsA("RemoteFunction") then return remote end
 end
 
+local function orderSelectedTools(char,backpack,token)
+    if orderingBackpack or not backpack or char:FindFirstChildOfClass("Tool") then return false end
+    local ordered,selected,selectedInstances={},{},{}
+    local choices={}
+    for slot=1,4 do
+        local name=selectedToys[slot]
+        choices[slot]=name
+        if name and name~="None" and not selected[name] then
+            local tool=backpack:FindFirstChild(name)
+            if not tool or not tool:IsA("Tool") then return false end
+            selected[name]=true
+            selectedInstances[tool]=true
+            ordered[#ordered+1]=tool
+        end
+    end
+    if #ordered==0 then return true end
+
+    local current={}
+    for _,tool in ipairs(backpack:GetChildren()) do
+        if tool:IsA("Tool") then
+            current[#current+1]=tool
+            if not selectedInstances[tool] then ordered[#ordered+1]=tool end
+        end
+    end
+    local matches=#current==#ordered
+    for index,tool in ipairs(ordered) do
+        if current[index]~=tool then matches=false; break end
+    end
+    if matches then return true end
+
+    -- Backpack UI assigns slots on ChildAdded. Reinsert in the selected order,
+    -- without unequipping a tool or requesting an already-owned toy again.
+    orderingBackpack=true
+    local detached={}
+    local success=true
+    for _,tool in ipairs(ordered) do
+        if tool.Parent==backpack then
+            local ok=pcall(function() tool.Parent=nil end)
+            if ok then detached[tool]=true else success=false end
+        else success=false end
+    end
+    -- Deferred ChildRemoved handlers must see the tools outside the Backpack
+    -- before ChildAdded assigns the new slots. Always restore even if cancelled.
+    task.wait()
+    local valid=alive and runtimeAlive and autoGetTools and token==recoveryToken
+        and player.Character==char and backpack.Parent==player
+    for slot=1,4 do if choices[slot]~=selectedToys[slot] then valid=false end end
+    for _,tool in ipairs(valid and ordered or current) do
+        if detached[tool] and tool.Parent==nil then
+            if not pcall(function() tool.Parent=backpack end) then success=false end
+        elseif tool.Parent~=backpack then success=false end
+    end
+    if valid then
+        local expected={}
+        for _,tool in ipairs(ordered) do expected[tool]=true end
+        for _,tool in ipairs(backpack:GetChildren()) do
+            if tool:IsA("Tool") and not expected[tool] then success=false; break end
+        end
+    end
+    orderingBackpack=false
+    return success and valid
+end
+
 local function cancelToyRequests()
     for _,attempt in pairs(toyAttempts) do
         if attempt.thread and type(task.cancel)=="function" then pcall(task.cancel,attempt.thread) end
     end
     table.clear(toyAttempts)
+    activeToyRequest=nil
 end
 
 local function cancelRecovery()
@@ -5877,6 +6922,7 @@ local function cancelRecovery()
     recoveryCharacter=nil
     recoveryDeadline=0
     rescanRequested=false
+    toyOrderDirty=true
     cancelToyRequests()
 end
 
@@ -5923,7 +6969,13 @@ requestRecovery=function(forceScan)
                 end
                 rescanRequested=false
 
-                if autoGetTools and now>=nextToyRequest then
+                if autoGetTools then
+                    local backpack=getBackpack()
+                    if toyOrderDirty and backpack and orderSelectedTools(char,backpack,token) then
+                        toyOrderDirty=false
+                    end
+                end
+                if autoGetTools and not activeToyRequest and now>=nextToyRequest then
                     local backpack=getBackpack()
                     local folder=findToyFolder()
                     local remote=toyRemote()
@@ -5933,16 +6985,17 @@ requestRecovery=function(forceScan)
                             local name=selectedToys[slot]
                             if name and name~="None" and not seen[name] then
                                 seen[name]=true
-                                if folder:FindFirstChild(name) and not hasSelectedTool(name,char,backpack) then
+                                if not hasSelectedTool(name,char,backpack) then
                                     local attempt=toyAttempts[name]
                                     if not attempt then
                                         attempt={count=0,nextAt=0,inFlight=false}
                                         toyAttempts[name]=attempt
                                     end
-                                    if not attempt.inFlight and attempt.count<6 and now>=attempt.nextAt then
+                                    if folder:FindFirstChild(name) and not attempt.inFlight and attempt.count<6 and now>=attempt.nextAt then
                                         attempt.count=attempt.count+1
                                         attempt.nextAt=now+math.min(3,0.75+attempt.count*0.5)
                                         attempt.inFlight=true
+                                        activeToyRequest=attempt
                                         nextToyRequest=now+0.25
                                         attempt.thread=task.spawn(function()
                                             if isCurrentRecovery(token,char) and autoGetTools then
@@ -5950,9 +7003,14 @@ requestRecovery=function(forceScan)
                                             end
                                             attempt.inFlight=false
                                             attempt.thread=nil
+                                            attempt.nextAt=math.max(attempt.nextAt,os.clock()+math.min(3,0.75+attempt.count*0.5))
+                                            if activeToyRequest==attempt then activeToyRequest=nil end
+                                            if isCurrentRecovery(token,char) and autoGetTools then requestRecovery(false) end
                                         end)
-                                        break
                                     end
+                                    -- Wait for this slot to actually arrive, including during
+                                    -- retries or catalog loading, before requesting later slots.
+                                    break
                                 end
                             end
                         end
@@ -5999,6 +7057,7 @@ local function watchBackpack(backpack)
     disconnectAll(backpackConnections)
     disconnectAll(toyConnections)
     observedBackpack=backpack
+    toyOrderDirty=true
     if not backpack then return end
     watchToyFolder(backpack:FindFirstChild("Toys"))
     backpackConnections[#backpackConnections+1]=backpack.ChildAdded:Connect(function(child)
@@ -6006,12 +7065,32 @@ local function watchBackpack(backpack)
             watchToyFolder(child)
             refreshToyDropdowns()
             requestRecovery(false)
+        elseif child:IsA("Tool") and not orderingBackpack then
+            toyOrderDirty=true
+            requestRecovery(false)
         end
     end)
     backpackConnections[#backpackConnections+1]=backpack.ChildRemoved:Connect(function(child)
-        if child.Name=="Toys" then watchToyFolder(nil) end
+        if child.Name=="Toys" then watchToyFolder(nil)
+        elseif child:IsA("Tool") and not orderingBackpack then
+            toyOrderDirty=true
+            requestRecovery(false)
+        end
     end)
     refreshToyDropdowns()
+end
+
+local function watchCharacter(char)
+    disconnectAll(characterConnections)
+    if not char then return end
+    local function changed(child)
+        if child:IsA("Tool") then
+            toyOrderDirty=true
+            requestRecovery(false)
+        end
+    end
+    characterConnections[1]=char.ChildAdded:Connect(changed)
+    characterConnections[2]=char.ChildRemoved:Connect(changed)
 end
 
 local function queueGuiRecovery()
@@ -6052,6 +7131,7 @@ end)
 local autoToggle=addToggle(section,"Auto Get Tools",autoGetTools,function(state)
     local wasEnabled=autoGetTools
     autoGetTools=state
+    toyOrderDirty=true
     SetCfg("autoGetTools",state)
     if state then
         if not wasEnabled then cancelToyRequests() end
@@ -6068,7 +7148,8 @@ for slot=1,4 do
         if refreshingDropdowns then return end
         selectedToys[slot]=selected
         SetCfg("autoToySlot"..slot,selected)
-        if autoGetTools and selected~="None" then
+        toyOrderDirty=true
+        if autoGetTools then
             local previous=toyAttempts[selected]
             if not previous or not previous.inFlight then toyAttempts[selected]=nil end
             requestRecovery(false)
@@ -6079,12 +7160,14 @@ section:AddButton("Refresh Toy List",function() refreshToyDropdowns() end)
 
 lifecycleConnections[#lifecycleConnections+1]=player.CharacterRemoving:Connect(function(char)
     removingCharacter=char
+    disconnectAll(characterConnections)
     cancelRecovery()
     targetsScanned=false
     table.clear(targetFunctions)
 end)
 lifecycleConnections[#lifecycleConnections+1]=player.CharacterAdded:Connect(function(char)
     removingCharacter=nil
+    watchCharacter(char)
     watchBackpack(player:FindFirstChildOfClass("Backpack"))
     requestRecovery(true)
 end)
@@ -6102,6 +7185,7 @@ lifecycleConnections[#lifecycleConnections+1]=replicatedStorage.DescendantAdded:
     if child.Name=="Remotes" or child.Name=="Extras" or child.Name=="ReplicateToy" then requestRecovery(false) end
 end)
 watchBackpack(player:FindFirstChildOfClass("Backpack"))
+watchCharacter(player.Character)
 watchPlayerGui(player:FindFirstChildOfClass("PlayerGui"))
 if inventoryEnabled or autoGetTools then task.defer(function() requestRecovery(false) end) end
 
@@ -6115,6 +7199,7 @@ env.VisualsV2Runtime.RegisterReset(function()
     autoGetTools=false
     disconnectAll(lifecycleConnections)
     disconnectAll(backpackConnections)
+    disconnectAll(characterConnections)
     disconnectAll(toyConnections)
     disconnectAll(guiConnections)
 end)
