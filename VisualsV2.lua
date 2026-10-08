@@ -27,6 +27,7 @@ local CFG_FILE = "VisualsV2_settings.json"
 local ConfigData = {}
 local PositionData = {}
 local configResetting = false
+local runtimeAlive = true
 
 local env = {}
 if type(getgenv) == "function" then
@@ -50,6 +51,7 @@ elseif type(read)=="function" then
 end
 local freshInstall=not configExistedAtStart
 local defaultOnControls={
+    aaIgnoreListEnabled=true,
     fireflyTimerEnabled=true,
     fireflyTimerColors=true,
     vv2FpsPingColors=true,
@@ -112,7 +114,7 @@ local function loadConfig()
 end
 
 local function saveConfig()
-    if type(write) ~= "function" then return false end
+    if not runtimeAlive or type(write) ~= "function" then return false end
     local payload = {
         version = 2,
         settings = ConfigData,
@@ -145,7 +147,7 @@ local function C(key, default)
 end
 
 local function SetCfg(key, value)
-    if configResetting then return end
+    if configResetting or not runtimeAlive then return end
     local target = isPositionKey(key) and PositionData or ConfigData
     if value == nil then
         target[key] = nil
@@ -224,6 +226,7 @@ env.VisualsV2Runtime.RegisterReset = function(callback)
     if type(callback) == "function" then table.insert(env.VisualsV2Runtime.Resetters, callback) end
 end
 env.VisualsV2Runtime.Cleanup = function()
+    runtimeAlive = false
     configResetting = true
     for _, resetter in ipairs(env.VisualsV2Runtime.Resetters or {}) do pcall(resetter) end
     configResetting = false
@@ -2515,39 +2518,15 @@ local speedGui, speedButton, speedToggle
 local BIG_BUTTON_DEFAULT = UDim2.new(0.5, 0, 0.5, 0)
 local BIND_BUTTON_DEFAULT = UDim2.new(0.10, 0, 0.90, 0)
 
--- Position migration: only replace positions that exactly match VV2's old defaults.
--- Custom user positions remain untouched.
-local function isSavedPosition(data,xs,xo,ys,yo)
-    return type(data)=="table"
-        and math.abs((tonumber(data.xs or data.XS) or 0)-xs)<0.0001
-        and math.abs((tonumber(data.xo or data.XO) or 0)-xo)<0.01
-        and math.abs((tonumber(data.ys or data.YS) or 0)-ys)<0.0001
-        and math.abs((tonumber(data.yo or data.YO) or 0)-yo)<0.01
-end
-
-if isSavedPosition(PositionData["speedButtonPosition"],0.5,-57,0.22,0) then
-    PositionData["speedButtonPosition"]=nil
-end
-if isSavedPosition(PositionData["speedBindButtonPosition"],0.10,0,0.72,0) then
-    PositionData["speedBindButtonPosition"]=nil
-end
-
-
--- Migrate defaults written by older builds. Custom values are left alone.
-if tonumber(ConfigData["speedButtonWidth"]) == 120 then speedButtonWidth = 115; ConfigData["speedButtonWidth"] = 115 end
-if tonumber(ConfigData["speedButtonHeight"]) == 44 then speedButtonHeight = 45; ConfigData["speedButtonHeight"] = 45 end
-if tonumber(ConfigData["speedButtonTransparency"]) == 3.6 then speedButtonTransparency = 4; ConfigData["speedButtonTransparency"] = 4 end
-if tonumber(ConfigData["speedBindButtonSize"]) == 2 then speedBindButtonSize = 5; ConfigData["speedBindButtonSize"] = 5 end
-
 local function loadStoredPosition(key, fallback)
     local data = C(key, nil)
     if type(data) ~= "table" then
-        PositionData[key] = {
+        SetCfg(key, {
             xs = fallback.X.Scale,
             xo = fallback.X.Offset,
             ys = fallback.Y.Scale,
             yo = fallback.Y.Offset,
-        }
+        })
         return fallback
     end
     return UDim2.new(
@@ -2903,7 +2882,42 @@ speedSection:AddSlider("Speed",1,300,speedValue,function(value)
     speedValue=value
     SetCfg("speedValue",value)
 end)
-speedSection:AddKeybind("Speed Glitch Bind","G",function() setSpeedState(not speedEnabled) end)
+local speedKeyName=tostring(C("speedGlitchKeybind","G"))
+local speedKeyCode
+pcall(function() speedKeyCode=Enum.KeyCode[speedKeyName] end)
+if not speedKeyCode or speedKeyCode==Enum.KeyCode.Unknown then
+    speedKeyName="G"
+    speedKeyCode=Enum.KeyCode.G
+    SetCfg("speedGlitchKeybind",speedKeyName)
+end
+local choosingSpeedKey=false
+local speedKeyConnection
+local function connectSpeedKeybind()
+    if speedKeyConnection then return end
+    speedKeyConnection=UserInputService.InputBegan:Connect(function(input,processed)
+        if input.UserInputType~=Enum.UserInputType.Keyboard then return end
+        if choosingSpeedKey then
+            if input.KeyCode==Enum.KeyCode.Unknown then return end
+            choosingSpeedKey=false
+            if input.KeyCode==Enum.KeyCode.Escape then
+                shared.Notify("Speed Glitch bind selection cancelled",2)
+                return
+            end
+            speedKeyCode=input.KeyCode
+            speedKeyName=speedKeyCode.Name
+            SetCfg("speedGlitchKeybind",speedKeyName)
+            shared.Notify("Speed Glitch bind saved: "..speedKeyName,2)
+        elseif not processed and not UserInputService:GetFocusedTextBox() and input.KeyCode==speedKeyCode then
+            setSpeedState(not speedEnabled)
+        end
+    end)
+end
+speedSection:AddButton("Speed Glitch Bind",function()
+    choosingSpeedKey=true
+    connectSpeedKeybind()
+    shared.Notify("Press a key to bind Speed Glitch (current: "..speedKeyName.."). Escape cancels.",3)
+end)
+connectSpeedKeybind()
 addToggle(speedSection,"Show Big Button",speedButtonVisible,function(state)
     speedButtonVisible=state; SetCfg("speedButtonVisible",state); updateSpeedButtonStyle()
 end)
@@ -2949,6 +2963,8 @@ RunService.Heartbeat:Connect(function()
 end)
 
 env.VisualsV2Runtime.RegisterReset(function()
+    choosingSpeedKey=false
+    if speedKeyConnection then speedKeyConnection:Disconnect(); speedKeyConnection=nil end
     speedToggle:Set(false)
     speedEnabled=false
     speedButtonVisible=false
@@ -2979,17 +2995,21 @@ local RunService = game:GetService("RunService")
 
 local LocalPlayer = Players.LocalPlayer
 
-local userWantsEnabled = false
+local userWantsEnabled = C("aaEnabled",false)
 local enabled = false
 local velocityConnection = nil
 local hadKnifeLastFrame = false
 
-local ignoreListEnabled = true
+local ignoreListEnabled = C("aaIgnoreListEnabled",true)
 local slot1Player = nil
 local slot2Player = nil
 local slot3Player = nil
 
 local aaSection = mainTab:AddSection("Anti-Aim Extension", "Utilities")
+local slot1Name=tostring(C("aaIgnorePlayer1","None"))
+local slot2Name=tostring(C("aaIgnorePlayer2","None"))
+local slot3Name=tostring(C("aaIgnorePlayer3","None"))
+local dropdownRefreshing=false
 
 local function getPlayerList()
     local list = {"None"}
@@ -3010,6 +3030,10 @@ local function findPlayerByName(name)
     end
     return nil
 end
+
+slot1Player=findPlayerByName(slot1Name)
+slot2Player=findPlayerByName(slot2Name)
+slot3Player=findPlayerByName(slot3Name)
 
 local function hasKnife()
     local backpack = LocalPlayer:FindFirstChild("Backpack")
@@ -3148,7 +3172,8 @@ local function startAntiAim()
     end)
 end
 
-aaSection:AddToggle("Enable Anti-Aim", function(bool)
+local antiAimToggle=addToggle(aaSection,"Enable Anti-Aim",userWantsEnabled,function(bool)
+    SetCfg("aaEnabled",bool)
     userWantsEnabled = bool
     enabled = bool
     if bool then
@@ -3160,7 +3185,8 @@ aaSection:AddToggle("Enable Anti-Aim", function(bool)
     end
 end)
 
-aaSection:AddToggle("Enable Ignore List", function(bool)
+local ignoreToggle=addToggle(aaSection,"Enable Ignore List",ignoreListEnabled,function(bool)
+    SetCfg("aaIgnoreListEnabled",bool)
     ignoreListEnabled = bool
     if bool then
         shared.Notify("Ignore List Enabled", 2)
@@ -3173,12 +3199,26 @@ local drop1, drop2, drop3
 
 local function updateDropdowns()
     local list = getPlayerList()
-    if drop1 then drop1.Change(list) end
-    if drop2 then drop2.Change(list) end
-    if drop3 then drop3.Change(list) end
+    dropdownRefreshing=true
+    local function refresh(drop,name)
+        if not drop then return end
+        pcall(function() drop.Change(list) end)
+        if type(drop.Select)=="function" then
+            local displayed=findPlayerByName(name) and name or "None"
+            local ok=pcall(drop.Select,displayed)
+            if not ok then pcall(function() drop:Select(displayed) end) end
+        end
+    end
+    refresh(drop1,slot1Name)
+    refresh(drop2,slot2Name)
+    refresh(drop3,slot3Name)
+    dropdownRefreshing=false
 end
 
-drop1 = aaSection:AddDropdown("Ignore Player 1", getPlayerList(), function(selected)
+drop1 = addDropdown(aaSection,"Ignore Player 1",getPlayerList(),slot1Name,function(selected)
+    if dropdownRefreshing then return end
+    slot1Name=tostring(selected or "None")
+    SetCfg("aaIgnorePlayer1",slot1Name)
     slot1Player = findPlayerByName(selected)
     if slot1Player then
         shared.Notify("Slot 1: " .. slot1Player.Name, 2)
@@ -3187,7 +3227,10 @@ drop1 = aaSection:AddDropdown("Ignore Player 1", getPlayerList(), function(selec
     end
 end)
 
-drop2 = aaSection:AddDropdown("Ignore Player 2", getPlayerList(), function(selected)
+drop2 = addDropdown(aaSection,"Ignore Player 2",getPlayerList(),slot2Name,function(selected)
+    if dropdownRefreshing then return end
+    slot2Name=tostring(selected or "None")
+    SetCfg("aaIgnorePlayer2",slot2Name)
     slot2Player = findPlayerByName(selected)
     if slot2Player then
         shared.Notify("Slot 2: " .. slot2Player.Name, 2)
@@ -3196,7 +3239,10 @@ drop2 = aaSection:AddDropdown("Ignore Player 2", getPlayerList(), function(selec
     end
 end)
 
-drop3 = aaSection:AddDropdown("Ignore Player 3", getPlayerList(), function(selected)
+drop3 = addDropdown(aaSection,"Ignore Player 3",getPlayerList(),slot3Name,function(selected)
+    if dropdownRefreshing then return end
+    slot3Name=tostring(selected or "None")
+    SetCfg("aaIgnorePlayer3",slot3Name)
     slot3Player = findPlayerByName(selected)
     if slot3Player then
         shared.Notify("Slot 3: " .. slot3Player.Name, 2)
@@ -3205,15 +3251,30 @@ drop3 = aaSection:AddDropdown("Ignore Player 3", getPlayerList(), function(selec
     end
 end)
 
-Players.PlayerAdded:Connect(function()
+local playerAddedConnection=Players.PlayerAdded:Connect(function()
+    slot1Player=findPlayerByName(slot1Name)
+    slot2Player=findPlayerByName(slot2Name)
+    slot3Player=findPlayerByName(slot3Name)
     updateDropdowns()
 end)
 
-Players.PlayerRemoving:Connect(function(player)
+local playerRemovingConnection=Players.PlayerRemoving:Connect(function(player)
     if slot1Player == player then slot1Player = nil end
     if slot2Player == player then slot2Player = nil end
     if slot3Player == player then slot3Player = nil end
     updateDropdowns()
+end)
+
+
+env.VisualsV2Runtime.RegisterReset(function()
+    antiAimToggle:Set(false)
+    ignoreToggle:Set(false)
+    userWantsEnabled=false
+    enabled=false
+    hadKnifeLastFrame=false
+    stopAntiAim()
+    playerAddedConnection:Disconnect()
+    playerRemovingConnection:Disconnect()
 end)
 end)()
 
@@ -3225,18 +3286,9 @@ local espSection = mainTab:AddSection("Distance ESP", "Utilities")
 local distanceEspEnabled = C("distanceEspEnabled", false)
 local distanceRenderDistance = C("distanceRenderDistance", 200)
 local distanceColor = C("distanceColor",Color3.fromRGB(0,0,0))
-if typeof(distanceColor)=="Color3"
-    and math.abs(distanceColor.R-(38/255))<0.001
-    and math.abs(distanceColor.G-(38/255))<0.001
-    and math.abs(distanceColor.B-(38/255))<0.001 then
-    distanceColor=Color3.fromRGB(0,0,0)
-    ConfigData["distanceColor"]=encodeConfigValue(distanceColor)
-end
 local distanceTextSize = C("distanceTextSize", 12)
 local distancePosition = C("distancePosition", "Bottom")
 local distanceObjects = {}
-if tonumber(ConfigData["distanceRenderDistance"]) == 175 then distanceRenderDistance = 200; ConfigData["distanceRenderDistance"] = 200 end
-if tonumber(ConfigData["distanceTextSize"]) == 8 then distanceTextSize = 12; ConfigData["distanceTextSize"] = 12 end
 
 local function distanceOffset()
     if distancePosition == "Top" then return Vector3.new(0, 3.25, 0) end
@@ -3378,17 +3430,6 @@ local dragging=false
 local dragInput,dragStart,startPos
 local DEFAULT_POS=UDim2.new(0.5,0,0.5,0)
 local buttonPos=loadStoredPosition("shootMurdButtonPosition",DEFAULT_POS)
-do
-    local old=PositionData["shootMurdButtonPosition"]
-    if type(old)=="table"
-        and math.abs((tonumber(old.xs) or 0)-0.5)<0.0001
-        and math.abs((tonumber(old.xo) or 0)+50)<0.01
-        and math.abs((tonumber(old.ys) or 0)-0.5)<0.0001
-        and math.abs((tonumber(old.yo) or 0)+20)<0.01 then
-        PositionData["shootMurdButtonPosition"]=nil
-        buttonPos=DEFAULT_POS
-    end
-end
 
 local resetShootMurdererPosition
 
@@ -3575,10 +3616,6 @@ local textToggle=addToggle(section,"Hide Button Text",hideText,function(v)
     hideText=v
     SetCfg("shootHideText",v)
     update()
-end)
-section:AddButton("Rescan Shoot Murderer Button",function()
-    local found=findButton()
-    if found then bind(found); shared.Notify("Shoot Murderer button found.",2) else shared.Notify("Shoot Murderer button was not found.",2) end
 end)
 section:AddButton("Reset Shoot Murderer Button Position",resetShootMurdererPosition)
 
@@ -4091,21 +4128,6 @@ local enabled=C("chatColorEnabled",false)
 local bubbleColor=C("chatBubbleColor",Color3.fromRGB(0,0,0))
 local textColor=C("chatTextColor",Color3.fromRGB(255,255,255))
 
--- Migrate the previous stock #262626 defaults without overriding custom colors.
-if typeof(bubbleColor)=="Color3"
-    and math.abs(bubbleColor.R-(38/255))<0.001
-    and math.abs(bubbleColor.G-(38/255))<0.001
-    and math.abs(bubbleColor.B-(38/255))<0.001 then
-    bubbleColor=Color3.fromRGB(0,0,0)
-    ConfigData["chatBubbleColor"]=encodeConfigValue(bubbleColor)
-end
-if typeof(textColor)=="Color3"
-    and math.abs(textColor.R-(38/255))<0.001
-    and math.abs(textColor.G-(38/255))<0.001
-    and math.abs(textColor.B-(38/255))<0.001 then
-    textColor=Color3.fromRGB(255,255,255)
-    ConfigData["chatTextColor"]=encodeConfigValue(textColor)
-end
 local originalBubble,originalText
 local childConn
 
@@ -4301,6 +4323,14 @@ local section=mainTab:AddSection("Coin Aura","Utilities")
 local enabled=C("coinAuraEnabled",false)
 local radius=math.clamp(tonumber(C("coinAuraRadius",8)) or 8,1,10)
 local conn=nil
+local addedConn,removingConn
+local coins,coinIndices,nextTouch={},{},{}
+local cursor=1
+local elapsed=0
+local STEP_INTERVAL=0.1
+local RETOUCH_DELAY=0.25
+local MAX_CHECKS=256
+local MAX_TOUCHES=8
 local function hasFireTouchInterest()
     return type(firetouchinterest)=="function"
 end
@@ -4313,48 +4343,96 @@ local function fireTouch(a,b)
     return ok0 or ok1
 end
 
-local function collect()
+local function isCoinPart(part)
+    if not part or not part:IsA("BasePart") or not part:FindFirstChild("TouchInterest") then return false end
+    local ancestor=part.Parent
+    while ancestor and ancestor~=workspace do
+        if ancestor.Name=="CoinContainer" then return true end
+        ancestor=ancestor.Parent
+    end
+    return false
+end
+
+local function removeCoin(part)
+    local index=coinIndices[part]
+    if not index then return end
+    local last=coins[#coins]
+    coins[index]=last
+    coins[#coins]=nil
+    coinIndices[part]=nil
+    nextTouch[part]=nil
+    if last~=part then coinIndices[last]=index end
+    if cursor>#coins then cursor=1 end
+end
+
+local function addCoin(part)
+    if coinIndices[part] or not isCoinPart(part) then return end
+    coins[#coins+1]=part
+    coinIndices[part]=#coins
+end
+
+local function discover(item)
+    if item:IsA("BasePart") then
+        addCoin(item)
+    elseif item.Name=="TouchInterest" and item.Parent then
+        addCoin(item.Parent)
+    end
+end
+
+local function collect(dt)
     if not enabled then return end
+    elapsed=elapsed+(tonumber(dt) or STEP_INTERVAL)
+    if elapsed<STEP_INTERVAL then return end
+    elapsed=elapsed%STEP_INTERVAL
     local char=player.Character
     local root=char and char:FindFirstChild("HumanoidRootPart")
     if not root then return end
 
     local rootPos=root.Position
-    local coinParts={}
-    local seen=setmetatable({}, {__mode="k"})
-
-    local function addContainer(container)
-        for _,part in ipairs(container:GetDescendants()) do
-            if part:IsA("BasePart") and not seen[part] and part:FindFirstChild("TouchInterest") then
-                seen[part]=true
-                table.insert(coinParts,part)
+    local radiusSquared=radius*radius
+    local now=os.clock()
+    local checked,touched=0,0
+    local total=#coins
+    while #coins>0 and checked<total and checked<MAX_CHECKS and touched<MAX_TOUCHES do
+        if cursor>#coins then cursor=1 end
+        local part=coins[cursor]
+        cursor=cursor+1
+        checked=checked+1
+        if part.Parent and part:FindFirstChild("TouchInterest") then
+            if now>=(nextTouch[part] or 0) then
+                local delta=part.Position-rootPos
+                local distanceSquared=delta.X*delta.X+delta.Y*delta.Y+delta.Z*delta.Z
+                if distanceSquared<=radiusSquared then
+                    nextTouch[part]=now+RETOUCH_DELAY
+                    if fireTouch(root,part) then touched=touched+1 end
+                end
             end
-        end
-    end
-
-    -- Same MM2 lookup used by AFP.
-    for _,child in ipairs(workspace:GetChildren()) do
-        if child.Name=="CoinContainer" then
-            addContainer(child)
-        end
-    end
-
-    -- Fallback if MM2 nests CoinContainer under the active map.
-    if #coinParts==0 then
-        for _,obj in ipairs(workspace:GetDescendants()) do
-            if obj.Name=="CoinContainer" then
-                addContainer(obj)
-            end
-        end
-    end
-
-    for _,part in ipairs(coinParts) do
-        if (rootPos-part.Position).Magnitude<=radius then
-            fireTouch(root,part)
+        else
+            removeCoin(part)
         end
     end
 end
-local function refresh() if conn then conn:Disconnect(); conn=nil end; if enabled then conn=RunService.Heartbeat:Connect(collect) end end
+
+local function refresh()
+    if conn then conn:Disconnect(); conn=nil end
+    if addedConn then addedConn:Disconnect(); addedConn=nil end
+    if removingConn then removingConn:Disconnect(); removingConn=nil end
+    table.clear(coins); table.clear(coinIndices); table.clear(nextTouch)
+    cursor=1; elapsed=0
+    if not enabled then return end
+
+    -- Enumerate once; subsequent coin spawns/removals maintain the cache.
+    addedConn=workspace.DescendantAdded:Connect(discover)
+    removingConn=workspace.DescendantRemoving:Connect(function(item)
+        if coinIndices[item] then
+            removeCoin(item)
+        elseif item.Name=="TouchInterest" and item.Parent then
+            removeCoin(item.Parent)
+        end
+    end)
+    for _,item in ipairs(workspace:GetDescendants()) do discover(item) end
+    conn=RunService.Heartbeat:Connect(collect)
+end
 local toggle=addToggle(section,"VV2 Coin Aura",enabled,function(v)
     enabled=v
     SetCfg("coinAuraEnabled",v)
@@ -4371,7 +4449,7 @@ section:AddSlider("VV2 Coin Aura Radius",1,10,radius,function(v)
     radius=math.clamp(tonumber(v) or 8,1,10)
     SetCfg("coinAuraRadius",radius)
 end)
-env.VisualsV2Runtime.RegisterReset(function() toggle:Set(false); enabled=false; if conn then conn:Disconnect(); conn=nil end end)
+env.VisualsV2Runtime.RegisterReset(function() toggle:Set(false); enabled=false; refresh() end)
 if enabled then refresh() end
 end)()
 
@@ -4385,10 +4463,6 @@ local autoClutch=C("fireflyAutoClutch",false)
 local timerEnabled=C("fireflyTimerEnabled",true)
 local timerColors=C("fireflyTimerColors",true)
 local timerSize=math.clamp(tonumber(C("fireflyTimerSize",10)) or 10,1,10)
-if tonumber(ConfigData["fireflyTimerSize"])==5 then
-    timerSize=10
-    ConfigData["fireflyTimerSize"]=10
-end
 local timerLocked=C("fireflyTimerLocked",false)
 local COUNTDOWN=2.5
 local COOLDOWN=16
@@ -4408,17 +4482,8 @@ local function timerCountdownColor(remaining,total)
     return TIMER_RED
 end
 
-if type(PositionData["fireflyTimerPosition"])=="table" then
-    local old=PositionData["fireflyTimerPosition"]
-    if math.abs((tonumber(old.xs) or 0)-0.5)<0.0001
-        and math.abs(tonumber(old.xo) or 0)<0.01
-        and math.abs((tonumber(old.ys) or 0)-0.10)<0.0001
-        and math.abs(tonumber(old.yo) or 0)<0.01 then
-        PositionData["fireflyTimerPosition"]=nil
-    end
-end
-
 local gui,timerLabel
+local timerDragConnections={}
 local countdownConnection,cooldownConnection,blockConnection
 local watchConnections={}
 local hookedTools=setmetatable({}, {__mode="k"})
@@ -4514,18 +4579,18 @@ local function buildTimer()
     timerLabel.InputChanged:Connect(function(input)
         if input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch then dragInput=input end
     end)
-    UserInputService.InputChanged:Connect(function(input)
+    table.insert(timerDragConnections,UserInputService.InputChanged:Connect(function(input)
         if not dragging or timerLocked or not timerEnabled or not timerLabel or input~=dragInput then return end
         local delta=input.Position-dragStart
         if delta.Magnitude>7 then moved=true end
         timerLabel.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+delta.X,startPos.Y.Scale,startPos.Y.Offset+delta.Y)
-    end)
-    UserInputService.InputEnded:Connect(function(input)
+    end))
+    table.insert(timerDragConnections,UserInputService.InputEnded:Connect(function(input)
         if not dragging then return end
         if input.UserInputType~=Enum.UserInputType.MouseButton1 and input.UserInputType~=Enum.UserInputType.Touch then return end
         dragging=false
-        if moved then saveStoredPosition("fireflyTimerPosition",timerLabel.Position) end
-    end)
+        if moved and timerLabel then saveStoredPosition("fireflyTimerPosition",timerLabel.Position) end
+    end))
 end
 
 local function fireJump()
@@ -4794,6 +4859,8 @@ env.VisualsV2Runtime.RegisterReset(function()
     timerColors=false
     timerLocked=false
     unhookTool()
+    for _,connection in ipairs(timerDragConnections) do disconnect(connection) end
+    table.clear(timerDragConnections)
     if gui then gui:Destroy(); gui=nil; timerLabel=nil end
 end)
 
@@ -5478,24 +5545,47 @@ local colors=C("vv2FpsPingColors",true)
 local showFps=C("vv2FpsPingShowFps",true)
 local showPing=C("vv2FpsPingShowPing",true)
 local showPlayers=C("vv2FpsPingShowPlayers",true)
-local monitorSize=math.clamp(tonumber(C("vv2FpsPingSize",5)) or 5,1,10)
-local pos=C("vv2FpsPingPosition","Top Right")
+local legacyMonitorSize=tonumber(ConfigData["vv2FpsPingSize"])
+local legacyMonitorScale=legacyMonitorSize and math.clamp(legacyMonitorSize,1,10)/5 or 1
+if tonumber(ConfigData["vv2FpsPingSizeScaleVersion"])~=2 then
+    -- Keep an existing display's physical size when migrating the old scale.
+    ConfigData["vv2FpsPingSize"]=legacyMonitorSize
+        and math.clamp(math.floor((legacyMonitorScale-0.5)*4+0.5),1,10) or 2
+    ConfigData["vv2FpsPingSizeScaleVersion"]=2
+end
+local monitorSize=math.clamp(tonumber(C("vv2FpsPingSize",2)) or 2,1,10)
 local locked=C("vv2FpsPingLocked",false)
 local gui,holder,fps,ping,playersLabel,monitorScale,renderConn
 local lastFps=0
 local dragConnections={}
-local presets={
-    ["Top Right"]=UDim2.new(.80,0,0,15),
-    ["Top Left"]=UDim2.new(.02,0,0,15),
-    ["Top Center"]=UDim2.new(.44,0,0,15),
-    ["Bottom Right"]=UDim2.new(.80,0,.85,0),
-    ["Bottom Left"]=UDim2.new(.02,0,.85,0)
-}
 local POSITION_KEY="vv2FpsPingMonitorPosition"
+local DEFAULT_POS=UDim2.new(0.5,0,0.05,0)
+if tonumber(ConfigData["vv2FpsPingAnchorVersion"])~=2 then
+    local saved=PositionData[POSITION_KEY]
+    if type(saved)=="table" then
+        local visibleCount=(showFps and 1 or 0)+(showPing and 1 or 0)+(showPlayers and 1 or 0)
+        saved.xo=(tonumber(saved.xo or saved.XO) or 0)+(120*legacyMonitorScale/2)
+        saved.yo=(tonumber(saved.yo or saved.YO) or 0)+(math.max(1,visibleCount*28-3)*legacyMonitorScale/2)
+    end
+    ConfigData["vv2FpsPingAnchorVersion"]=2
+end
 local BLACK=Color3.fromRGB(0,0,0)
 local GREEN=Color3.fromRGB(0,255,0)
 local YELLOW=Color3.fromRGB(255,200,0)
 local RED=Color3.fromRGB(255,0,0)
+local monitorToggle,fpsToggle,pingToggle,playersToggle
+
+local function ensureMonitorStatistic()
+    if configResetting or not enabled or showFps or showPing or showPlayers then return end
+    showFps=true
+    SetCfg("vv2FpsPingShowFps",true)
+    pcall(function()
+        shared.Notify("Error: Enable at least one statistic, or turn off Monitor UI. FPS has been enabled.",4)
+    end)
+    task.defer(function()
+        if showFps and fpsToggle then fpsToggle:Set(true) end
+    end)
+end
 
 local function root()
     if type(gethui)=="function" then
@@ -5513,29 +5603,11 @@ local function disconnectDragConnections()
 end
 
 local function decodeSavedPosition(fallback)
-    local data=PositionData[POSITION_KEY]
-    if type(data)~="table" then
-        PositionData[POSITION_KEY]={
-            xs=fallback.X.Scale,xo=fallback.X.Offset,
-            ys=fallback.Y.Scale,yo=fallback.Y.Offset,
-        }
-        saveConfig()
-        return fallback
-    end
-    return UDim2.new(
-        tonumber(data.xs or data.XS) or fallback.X.Scale,
-        tonumber(data.xo or data.XO) or fallback.X.Offset,
-        tonumber(data.ys or data.YS) or fallback.Y.Scale,
-        tonumber(data.yo or data.YO) or fallback.Y.Offset
-    )
+    return loadStoredPosition(POSITION_KEY,fallback)
 end
 
 local function saveMonitorPosition(position)
-    PositionData[POSITION_KEY]={
-        xs=position.X.Scale,xo=position.X.Offset,
-        ys=position.Y.Scale,yo=position.Y.Offset,
-    }
-    saveConfig()
+    saveStoredPosition(POSITION_KEY,position)
 end
 
 local function setMonitorPosition(position,saveIt)
@@ -5595,7 +5667,7 @@ local function applyMonitorLayout()
     end
     holder.Size=UDim2.fromOffset(120,math.max(1,y-3))
     holder.Visible=showFps or showPing or showPlayers
-    if monitorScale then monitorScale.Scale=monitorSize/5 end
+    if monitorScale then monitorScale.Scale=0.5+(monitorSize*0.25) end
 end
 
 local function updateMonitorStats(value)
@@ -5667,6 +5739,7 @@ local function destroy()
 end
 
 local function create()
+    ensureMonitorStatistic()
     destroy()
 
     gui=Instance.new("ScreenGui")
@@ -5679,8 +5752,9 @@ local function create()
     holder.Name="VisualsV2_StatsHolder"
     holder.BackgroundTransparency=1
     holder.Size=UDim2.fromOffset(120,81)
+    holder.AnchorPoint=Vector2.new(0.5,0.5)
     holder.Active=true
-    holder.Position=decodeSavedPosition(presets[pos] or presets["Top Right"])
+    holder.Position=decodeSavedPosition(DEFAULT_POS)
     holder.Parent=gui
 
     monitorScale=Instance.new("UIScale")
@@ -5708,7 +5782,7 @@ local function create()
     end)
 end
 
-local monitorToggle=addToggle(section,"VV2 Enable Monitor UI",enabled,function(v)
+monitorToggle=addToggle(section,"VV2 Enable Monitor UI",enabled,function(v)
     enabled=v
     SetCfg("vv2FpsPingEnabled",v)
     if v then create() else destroy() end
@@ -5720,26 +5794,29 @@ local colorToggle=addToggle(section,"VV2 Enable Statistic Colors",colors,functio
     updateMonitorStats()
 end)
 
-local fpsToggle=addToggle(section,"Show FPS",showFps,function(v)
+fpsToggle=addToggle(section,"Show FPS",showFps,function(v)
     showFps=v
     SetCfg("vv2FpsPingShowFps",v)
+    ensureMonitorStatistic()
     applyMonitorLayout()
 end)
 
-local pingToggle=addToggle(section,"Show Ping",showPing,function(v)
+pingToggle=addToggle(section,"Show Ping",showPing,function(v)
     showPing=v
     SetCfg("vv2FpsPingShowPing",v)
+    ensureMonitorStatistic()
     applyMonitorLayout()
 end)
 
-local playersToggle=addToggle(section,"Show Player Count",showPlayers,function(v)
+playersToggle=addToggle(section,"Show Player Count",showPlayers,function(v)
     showPlayers=v
     SetCfg("vv2FpsPingShowPlayers",v)
+    ensureMonitorStatistic()
     applyMonitorLayout()
 end)
 
 section:AddSlider("Monitor Size",1,10,monitorSize,function(value)
-    monitorSize=math.clamp(tonumber(value) or 5,1,10)
+    monitorSize=math.clamp(tonumber(value) or 2,1,10)
     SetCfg("vv2FpsPingSize",monitorSize)
     applyMonitorLayout()
 end)
@@ -5750,10 +5827,8 @@ local lockToggle=addToggle(section,"Lock Monitor Position",locked,function(v)
 end)
 
 section:AddButton("Reset Monitor Position",function()
-    pos="Top Center"
-    SetCfg("vv2FpsPingPosition",pos)
-    setMonitorPosition(presets["Top Center"],true)
-
+    SetCfg("vv2FpsPingPosition","Top Center")
+    setMonitorPosition(DEFAULT_POS,true)
 end)
 
 env.VisualsV2Runtime.RegisterReset(function()
@@ -5932,8 +6007,8 @@ end)()
 -- =========================================================
 -- If VisualsV2_settings.json is deleted while the add-on is running,
 -- immediately turn off/reset active features and recreate a blank settings file.
--- All boolean C() defaults in this build are false, so the next execution also
--- starts with every feature disabled.
+-- Feature toggles reset; requested timer/statistic display defaults are restored
+-- when the add-on next loads its settings.
 ;(function()
 if type(exists)~="function" then return end
 
@@ -5966,8 +6041,8 @@ task.spawn(function()
             end
             configResetting=false
 
-            -- Recreate only an empty VisualsV2 schema. Since every boolean
-            -- default is false, future executions remain fully disabled.
+            -- Recreate an empty VisualsV2 schema; the next execution seeds the
+            -- declared defaults without restoring the deleted settings.
             if type(write)=="function" then
                 pcall(function()
                     write(CFG_FILE,HttpService:JSONEncode({
@@ -6005,4 +6080,5 @@ creditsSection:AddLabel("lzzzx, 187 — 586568393801596928")
 creditsSection:AddLabel("arkineku — 1418738338508308691")
 end)()
 
+saveConfig()
 shared.Notify("Visions V2 loaded",2)
