@@ -5667,7 +5667,7 @@ local function applyMonitorLayout()
     end
     holder.Size=UDim2.fromOffset(120,math.max(1,y-3))
     holder.Visible=showFps or showPing or showPlayers
-    if monitorScale then monitorScale.Scale=0.5+(monitorSize*0.25) end
+    if monitorScale then monitorScale.Scale=0.4+((monitorSize-1)*(2.6/9)) end
 end
 
 local function updateMonitorStats(value)
