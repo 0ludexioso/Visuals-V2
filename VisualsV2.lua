@@ -4512,7 +4512,7 @@ local function updateTimerDisplay()
         timerLabel.Text=string.format("%.1fCD",math.max(0,remaining))
         timerLabel.TextColor3=timerColors and timerCountdownColor(remaining,total) or TIMER_BLACK
     else
-        timerLabel.Text="Active"
+        timerLabel.Text="Ready"
         timerLabel.TextColor3=TIMER_BLACK
     end
 end
@@ -4557,7 +4557,7 @@ local function buildTimer()
     timerLabel.TextColor3=Color3.new(0,0,0)
     timerLabel.TextStrokeTransparency=1
     timerLabel.Font=Enum.Font.GothamBold
-    timerLabel.Text="Active"
+    timerLabel.Text="Ready"
     timerLabel.Visible=timerEnabled
     timerLabel.Active=true
     timerLabel.Parent=gui
