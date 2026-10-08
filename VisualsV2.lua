@@ -654,17 +654,9 @@ local loaderCheck = task.spawn(function()
 end)
 RootMaid:GiveTask(function() pcall(task.cancel, loaderCheck) end)
 
-local function isR15()
-    local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-    if not alive or not runtimeAlive or not character then return false end
-    local humanoid = character:WaitForChild("Humanoid", 10)
-    return alive and runtimeAlive and humanoid and humanoid.RigType == Enum.HumanoidRigType.R15
-end
-if not isR15() then return end
+
 
 local feAnimSection = mainTab:AddSection("FE Animations", "Cosmetic")
-local FEAnimMaid = Maid.new()
-RootMaid:GiveTask(function() FEAnimMaid:DoCleaning() end)
 
 local animPresets = {
             ["Default"] = nil,
@@ -1136,15 +1128,6 @@ local animPresets = {
             },
         }
 
-local animMap = {
-            idle  = { folder = "idle",  slots = { { child = "Animation1", origKey = "idle1" }, { child = "Animation2", origKey = "idle2" } } },
-            walk  = { folder = "walk",  slots = { { child = "WalkAnim",   origKey = "walk"  } } },
-            run   = { folder = "run",   slots = { { child = "RunAnim",    origKey = "run"   } } },
-            jump  = { folder = "jump",  slots = { { child = "JumpAnim",   origKey = "jump"  } } },
-            climb = { folder = "climb", slots = { { child = "ClimbAnim",  origKey = "climb" } } },
-            fall  = { folder = "fall",  slots = { { child = "FallAnim",   origKey = "fall"  } } },
-        }
-
 local allAnimOptions = {
             "Default", "Vampire", "Hero", "Zombie Classic", "Mage", "Ghost",
             "Elder", "Levitation", "Astronaut", "Ninja", "Werewolf", "Cartoon",
@@ -1169,336 +1152,494 @@ local allAnimOptions = {
             "Oldschool", "Spider", "Joy", "Flying Aura", "FHA V2", "Silent Nurse", "Supermodel", "Enchanted Fairy", "Furry", "Vlada Model", "R6 Converter"
         }
 
-table.insert(allAnimOptions, "Custom")
-table.insert(runAnimOptions, "Custom")
-
 local presetKeys = {
     all = "feAnimPresetAll", idle = "feAnimPresetIdle", walk = "feAnimPresetWalk",
-    run = "feAnimPresetRun", jump = "feAnimPresetJump", climb = "feAnimPresetClimb",
-    fall = "feAnimPresetFall",
+    run = "feAnimPresetRun", jump = "feAnimPresetJump", climb = "feAnimPresetClimb", fall = "feAnimPresetFall",
 }
 local customSlots = {
-    {key = "idle1", label = "Idle 1", config = "feAnimCustomIdle1"},
-    {key = "idle2", label = "Idle 2", config = "feAnimCustomIdle2"},
+    {key = "idle", label = "Idle", config = "feAnimCustomIdle"},
     {key = "walk", label = "Walk", config = "feAnimCustomWalk"},
     {key = "run", label = "Run", config = "feAnimCustomRun"},
     {key = "jump", label = "Jump", config = "feAnimCustomJump"},
     {key = "climb", label = "Climb", config = "feAnimCustomClimb"},
     {key = "fall", label = "Fall", config = "feAnimCustomFall"},
+    {key = "swim", label = "Swim", config = "feAnimCustomSwim"},
 }
-
 local function cleanAnimationId(value)
     local text = tostring(value or ""):match("^%s*(.-)%s*$")
     if text == "" then return "" end
     local id = text:match("^(%d+)$") or text:match("^rbxassetid://(%d+)$")
         or text:match("^https?://[^/]*roblox%.com/.*[?&]id=(%d+)")
-    if not id then return nil end
-    id = id:gsub("^0+", "")
-    return id
+        or text:match("^https?://[^/]*roblox%.com/catalog/(%d+)")
+        or text:match("^https?://[^/]*roblox%.com/library/(%d+)")
+    return id and id:gsub("^0+", "") or nil
 end
 
-local feAnimEnabled = C("feAnimEnabled", false) == true
 local animState, customAnims = {}, {}
+local legacyEnabled = C("feAnimEnabled", false) == true
+local hadCustom, hadPreset = false, false
 for animType, key in pairs(presetKeys) do
     local selected = C(key, "Default")
-    if selected ~= "Default" and selected ~= "Custom" and not animPresets[selected] then
-        selected = "Default"
-    elseif selected == "OG Rthro Run" and animType ~= "run" then
-        selected = "Default"
-    end
+    if selected == "Custom" then hadCustom = true; selected = "Default" end
+    if type(selected) ~= "string" or (selected ~= "Default" and not animPresets[selected])
+        or (selected == "OG Rthro Run" and animType ~= "run") then selected = "Default" end
+    if selected ~= "Default" then hadPreset = true end
     animState[animType] = selected
+    ConfigData[key] = selected
 end
+if ConfigData.feAnimCustomIdle == nil then
+    local oldIdle = cleanAnimationId(ConfigData.feAnimCustomIdle1) or ""
+    if oldIdle == "" then oldIdle = cleanAnimationId(ConfigData.feAnimCustomIdle2) or "" end
+    ConfigData.feAnimCustomIdle = oldIdle
+end
+ConfigData.feAnimCustomIdle1, ConfigData.feAnimCustomIdle2 = nil, nil
 for _, slot in ipairs(customSlots) do
     customAnims[slot.key] = cleanAnimationId(C(slot.config, "")) or ""
+    ConfigData[slot.config] = customAnims[slot.key]
+end
+local presetsEnabled = C("feAnimPresetsEnabled", legacyEnabled and (hadPreset or not hadCustom)) == true
+local customEnabled = C("feAnimCustomEnabled", legacyEnabled and hadCustom) == true
+ConfigData.feAnimEnabled = presetsEnabled or customEnabled
+local function enabled() return presetsEnabled or customEnabled end
+
+-- These catalog containers use separate playback clips. Presets already
+-- contain playback IDs; arbitrary custom catalog IDs are resolved on demand.
+local assetRedirects = {
+    ["122068681350601"] = "114884344098450",
+    ["101475660523078"] = "131634789076585",
+    ["90924872939548"] = "137659653949709",
+    ["126408720389134"] = "75834860496519",
+    ["103902117192422"] = "125215321499925",
+    ["103415879046292"] = "113534064176043",
+}
+local assetCache = env.VisualsV2FEAnimationAssets
+if type(assetCache) ~= "table" then assetCache = {}; env.VisualsV2FEAnimationAssets = assetCache end
+local aliases = {
+    idle = "idle", idle1 = "idle", idle2 = "idle", animation1 = "idle", animation2 = "idle",
+    walk = "walk", walkanim = "walk", run = "run", runanim = "run", jump = "jump", jumpanim = "jump",
+    climb = "climb", climbanim = "climb", fall = "fall", fallanim = "fall",
+    swim = "swim", swimanim = "swim", swimidle = "swim", swimidleanim = "swim",
+}
+local emoteGroups = {wave = true, point = true, dance = true, dance2 = true, dance3 = true, laugh = true, cheer = true}
+local defaultMoves = {
+    ["507766666"] = "idle", ["507766951"] = "idle", ["507766388"] = "idle",
+    ["507777826"] = "walk", ["507767714"] = "run", ["507765000"] = "jump",
+    ["507765644"] = "climb", ["507767968"] = "fall",
+    ["507784897"] = "swim", ["507785072"] = "swim",
+    ["180435571"] = "idle", ["180435792"] = "idle", ["180426354"] = "walk",
+    ["125750702"] = "jump", ["180436148"] = "climb", ["180436334"] = "fall",
+}
+
+local session, generation = nil, 0
+local updateMotion, refreshRuntime
+local function valid(s)
+    return alive and runtimeAlive and enabled() and session == s and s.token == generation
+        and LocalPlayer.Character == s.character and s.character.Parent ~= nil
+end
+local function stopTrack(track, fade)
+    if track then pcall(function() track:Stop(fade or 0.12) end) end
+end
+local function restoreWeights(s)
+    for track, weight in pairs(s.weights or {}) do
+        s.weights[track] = nil
+        pcall(function() track:AdjustWeight(weight, 0.12) end)
+    end
+end
+local function dropRecord(s, kind)
+    local record = s.tracks[kind]
+    if not record then return end
+    s.tracks[kind] = nil; record.disposed = true
+    if s.current == record then s.current = nil; restoreWeights(s) end
+    if record.track then
+        s.ownTracks[record.track] = nil
+        stopTrack(record.track)
+        pcall(function() record.track:Destroy() end)
+    end
+    if record.animation then pcall(function() record.animation:Destroy() end) end
+end
+local function closeSession()
+    generation = generation + 1
+    local old = session; session = nil
+    if not old then return end
+    for _, connection in ipairs(old.connections) do pcall(function() connection:Disconnect() end) end
+    restoreWeights(old)
+    for kind in pairs(old.tracks) do dropRecord(old, kind) end
+    if old.references then pcall(function() old.references:Destroy() end) end
 end
 
-local originalAnims = {}
-local originalCharacter
-local originalsByCharacter = setmetatable({}, {__mode = "k"})
-local spawnToken = 0
-local updateSerial = 0
-local applyRunning = false
-local applyingScripts = {}
-
-local function isCurrentSpawn(character, token)
-    return alive and runtimeAlive and feAnimEnabled and token == spawnToken
-        and LocalPlayer.Character == character and character.Parent ~= nil
+local function animationGroup(animation, character)
+    local node = animation
+    if not node or not node:IsDescendantOf(character) then return nil end
+    while node.Parent and node.Parent ~= character do
+        if node.Parent:IsA("LuaSourceContainer") then return node.Name:lower() end
+        node = node.Parent
+    end
 end
-
--- Wait for every Animate folder and populated asset ID before recording
--- defaults. Selections can be restored before a character finishes loading.
-local function waitForAnimateReady(character, token, timeout)
-    local started = os.clock()
-    local function remaining() return math.max(timeout - (os.clock() - started), 0) end
-    local Animate = character:WaitForChild("Animate", remaining())
-    if not Animate or not isCurrentSpawn(character, token) then return nil end
-    for _, info in pairs(animMap) do
-        local folder = Animate:WaitForChild(info.folder, remaining())
-        if not folder or not isCurrentSpawn(character, token) then return nil end
-        for _, slot in ipairs(info.slots) do
-            local anim = folder:WaitForChild(slot.child, remaining())
-            if not anim or not isCurrentSpawn(character, token) then return nil end
-            while anim.AnimationId == "" and remaining() > 0 do
-                task.wait(0.05)
-                if not isCurrentSpawn(character, token) then return nil end
+local function nativeKind(s, track)
+    if s.ownTracks[track] then return nil end
+    local animation = track.Animation
+    if not animation or animation:FindFirstAncestorOfClass("Tool") then return nil end
+    local group = animationGroup(animation, s.character)
+    if group and (emoteGroups[group] or group:find("emote", 1, true)) then return nil end
+    local kind = group and aliases[group]
+    if kind then return kind end
+    local id = cleanAnimationId(animation.AnimationId)
+    if id and s.nativeIds[id] then return s.nativeIds[id] end
+    local name = tostring(animation.Name or track.Name or ""):lower():gsub("[%s_]", "")
+    return aliases[name] or (id and defaultMoves[id])
+end
+local function isEmote(s, track)
+    if s.ownTracks[track] or nativeKind(s, track) then return false end
+    local animation = track.Animation
+    if not animation or animation:FindFirstAncestorOfClass("Tool") then return false end
+    local group = animationGroup(animation, s.character)
+    if group then return emoteGroups[group] == true or group:find("emote", 1, true) ~= nil end
+    local name = (tostring(track.Name or "") .. " " .. tostring(animation.Name or "")):lower()
+    local id = cleanAnimationId(animation.AnimationId)
+    return (id and s.emoteIds[id]) or name:find("emote", 1, true) ~= nil or name:find("dance", 1, true) ~= nil
+end
+local function collectNativeIds(s)
+    for _, child in ipairs(s.character:GetChildren()) do
+        if child ~= s.references and child:IsA("LuaSourceContainer") then
+            for _, animation in ipairs(child:GetDescendants()) do
+                if animation:IsA("Animation") then
+                    local group = animationGroup(animation, s.character)
+                    local kind = group and aliases[group]
+                    local id = cleanAnimationId(animation.AnimationId)
+                    if id and kind then s.nativeIds[id] = kind end
+                end
             end
-            if anim.AnimationId == "" then return nil end
         end
     end
-    return Animate
+end
+local function playbackTargets()
+    local result = {}
+    for _, slot in ipairs(customSlots) do
+        local kind, id = slot.key, nil
+        if presetsEnabled and kind ~= "swim" then
+            local selected = animState[kind]
+            if selected == "Default" then selected = animState.all end
+            local preset = animPresets[selected]
+            if preset then id = cleanAnimationId(preset[kind == "idle" and "idle1" or kind]) end
+        end
+        if customEnabled and customAnims[kind] ~= "" then id = customAnims[kind] end
+        if id and id ~= "" then result[kind] = assetRedirects[id] or id end
+    end
+    return result
 end
 
-local function saveOriginalAnimations(character)
-    local cached = originalsByCharacter[character]
-    if cached then
-        originalCharacter, originalAnims = character, cached
+local function resolveCatalog(id, kind)
+    local key = id .. ":" .. kind
+    if assetCache[key] then return assetCache[key] end
+    local ok, objects = pcall(function() return game:GetObjects("rbxassetid://" .. id) end)
+    if not ok or type(objects) ~= "table" then return id end
+    local resolved, score = nil, -1
+    local function inspect(animation)
+        if not animation:IsA("Animation") then return end
+        local candidate = cleanAnimationId(animation.AnimationId)
+        if not candidate or candidate == "" then return end
+        local name = animation.Name:lower()
+        local match = aliases[name] == kind and 2 or 0
+        if name == kind or (kind == "idle" and name == "animation1") then match = 3 end
+        if match > score then resolved, score = candidate, match end
+    end
+    for _, object in ipairs(objects) do
+        inspect(object)
+        for _, child in ipairs(object:GetDescendants()) do inspect(child) end
+        pcall(function() object:Destroy() end)
+    end
+    if resolved and alive and runtimeAlive then assetCache[key] = resolved end
+    return resolved or id
+end
+local function reportLoadError(s, record)
+    if not valid(s) or record.disposed or record.notified then return end
+    record.notified = true
+    shared.Notify("Error: Could not load the " .. record.kind .. " animation (" .. record.rawId .. "). Check its ID and animation access.", 0)
+end
+local function loadRecord(s, kind)
+    local id = s.targets[kind]
+    if not id then return nil end
+    local old = s.tracks[kind]
+    if old and old.rawId == id then return old end
+    dropRecord(s, kind)
+    local record = {rawId = id, kind = kind, pending = true}
+    s.tracks[kind] = record
+    local function stillCurrent() return valid(s) and not record.disposed and s.tracks[kind] == record end
+    local function install(playbackId)
+        if not stillCurrent() then return false end
+        if record.track then
+            s.ownTracks[record.track] = nil; stopTrack(record.track)
+            pcall(function() record.track:Destroy() end)
+            record.track = nil
+        end
+        if record.animation then record.animation:Destroy() end
+        local animation = Instance.new("Animation")
+        animation.Name = "VisualsV2_FE_" .. kind
+        animation.AnimationId = "rbxassetid://" .. playbackId
+        animation.Parent = s.references
+        record.animation = animation
+        local ok, track = pcall(function() return s.animator:LoadAnimation(animation) end)
+        if not stillCurrent() then
+            if ok and track then pcall(function() track:Destroy() end) end
+            animation:Destroy(); return false
+        end
+        if not ok or not track then return false end
+        record.track = track; s.ownTracks[track] = true
+        track.Priority = Enum.AnimationPriority.Movement
+        track.Looped = kind ~= "jump"
+        record.pending = false
+        if s.current == record then s.current = nil end
+        updateMotion(s)
         return true
     end
-    local Animate = character:FindFirstChild("Animate")
-    if not Animate then return false end
-    local originals = {}
-    for _, info in pairs(animMap) do
-        local folder = Animate:FindFirstChild(info.folder)
-        if not folder then return false end
-        for _, slot in ipairs(info.slots) do
-            local anim = folder:FindFirstChild(slot.child)
-            if not anim or anim.AnimationId == "" then return false end
-            originals[slot.origKey] = anim.AnimationId
+    task.spawn(function()
+        local firstId = assetCache[id .. ":" .. kind] or id
+        local loaded = install(firstId)
+        if not loaded and stillCurrent() then
+            local resolved = resolveCatalog(id, kind)
+            loaded = resolved ~= firstId and install(resolved)
+        end
+        if not loaded then
+            record.pending = false; record.failed = true
+            reportLoadError(s, record); return
+        end
+        -- LoadAnimation can return before the clip has downloaded. Resolve
+        -- catalog containers only when no playback data arrives, not per frame.
+        task.wait(2)
+        if not stillCurrent() or not record.track or record.track.Length > 0 then return end
+        local resolved = resolveCatalog(id, kind)
+        if not stillCurrent() then return end
+        if resolved ~= firstId then install(resolved) end
+        task.wait(6)
+        if stillCurrent() and record.track and record.track.Length == 0 then reportLoadError(s, record) end
+    end)
+    return record
+end
+
+local function desiredMotion(s)
+    local humanoid = s.humanoid
+    local state = humanoid:GetState()
+    if humanoid.Health <= 0 or humanoid.Sit or state == Enum.HumanoidStateType.Dead
+        or state == Enum.HumanoidStateType.Seated or state == Enum.HumanoidStateType.PlatformStanding
+        or state == Enum.HumanoidStateType.Physics or state == Enum.HumanoidStateType.Ragdoll then return nil, 1 end
+    if state == Enum.HumanoidStateType.Swimming then
+        return "swim", math.clamp((s.swimSpeed or 0) / 10, 0.1, 3)
+    end
+    if state == Enum.HumanoidStateType.Climbing then return "climb", math.clamp((s.climbSpeed or 0) / 12, -3, 3) end
+    if state == Enum.HumanoidStateType.Jumping then return "jump", 1 end
+    if state == Enum.HumanoidStateType.Freefall then
+        if s.targets.jump and os.clock() - s.jumpedAt < 0.3 then return "jump", 1 end
+        return "fall", 1
+    end
+    local speed = s.runSpeed or 0
+    local moving = humanoid.MoveDirection.Magnitude > 0.01 or speed > 0.5
+    if not moving then return "idle", 1 end
+    if speed <= 0.5 then speed = humanoid.MoveDirection.Magnitude * humanoid.WalkSpeed end
+    local kind = speed >= math.max(humanoid.WalkSpeed * 0.75, 1) and "run" or "walk"
+    if not s.targets[kind] then kind = kind == "run" and "walk" or "run" end
+    return kind, math.clamp(speed / (kind == "walk" and 8 or 16), 0.1, 3)
+end
+local function sameMovement(native, active)
+    if active == "walk" or active == "run" then return native == "walk" or native == "run" end
+    if active == "fall" then return native == "fall" or native == "jump" end
+    return native == active
+end
+updateMotion = function(s)
+    if not valid(s) or not s.ready then return end
+    local playing = s.animator:GetPlayingAnimationTracks()
+    local kind, speed = desiredMotion(s)
+    for _, track in ipairs(playing) do
+        if track.IsPlaying and isEmote(s, track) then kind = nil; break end
+    end
+    if not kind or not s.targets[kind] then
+        if s.current then stopTrack(s.current.track); s.current = nil end
+        restoreWeights(s); return
+    end
+    if s.current and s.current.kind ~= kind then
+        stopTrack(s.current.track); s.current = nil; restoreWeights(s)
+    end
+    local record = loadRecord(s, kind)
+    if not record or not record.track or record.pending or record.failed then return end
+    if s.current ~= record then
+        if s.current then stopTrack(s.current.track) end
+        restoreWeights(s)
+        s.current = record
+        record.lastJump = nil
+    end
+    local track = record.track
+    if not track.IsPlaying and (kind ~= "jump" or record.lastJump ~= s.jumpCount) then
+        track:Play(0.12, 1, speed)
+        if kind == "jump" then record.lastJump = s.jumpCount end
+    else
+        track:AdjustSpeed(speed)
+    end
+    if not track.IsPlaying or track.Length <= 0 then restoreWeights(s); return end
+    -- Leave native tracks running so disabling this feature restores them
+    -- immediately. Only their competing movement weights are suppressed.
+    local suppressed = {}
+    for _, native in ipairs(playing) do
+        local nativeMotion = nativeKind(s, native)
+        if native.IsPlaying and nativeMotion and sameMovement(nativeMotion, kind) then
+            local weight = native.WeightTarget
+            if s.weights[native] == nil then s.weights[native] = weight end
+            if weight > 0 then s.weights[native] = weight end
+            native:AdjustWeight(0, 0.12)
+            suppressed[native] = true
         end
     end
-    originalsByCharacter[character] = originals
-    originalCharacter, originalAnims = character, originals
-    return true
-end
-
-local function stopAllAnimations(character)
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    if not humanoid then return end
-    for _, track in pairs(humanoid:GetPlayingAnimationTracks()) do
-        track:Stop(0)
+    for native, weight in pairs(s.weights) do
+        if not suppressed[native] then
+            s.weights[native] = nil
+            pcall(function() native:AdjustWeight(weight, 0.12) end)
+        end
     end
 end
 
-local function releaseAnimationScripts()
-    for Animate in pairs(applyingScripts) do
-        applyingScripts[Animate] = nil
-        pcall(function() Animate.Disabled = false end)
+local function refreshTargets(s)
+    if not valid(s) or not s.ready then return end
+    local targets = playbackTargets()
+    for kind, record in pairs(s.tracks) do
+        if targets[kind] ~= record.rawId then dropRecord(s, kind) end
     end
+    s.targets = targets
+    updateMotion(s)
 end
-
-local function restoreDefaultAnimations(character)
-    character = character or LocalPlayer.Character
-    local originals = character and originalsByCharacter[character]
-    local Animate = character and character:FindFirstChild("Animate")
-    if not originals or not Animate then return end
-    stopAllAnimations(character)
-    Animate.Disabled = true
-    for _, info in pairs(animMap) do
-        local folder = Animate:FindFirstChild(info.folder)
-        if folder then
-            for _, slot in ipairs(info.slots) do
-                local anim = folder:FindFirstChild(slot.child)
-                if anim and originals[slot.origKey] then
-                    anim.AnimationId = originals[slot.origKey]
-                end
+local function bindCharacter(character)
+    closeSession()
+    if not alive or not runtimeAlive or not enabled() or LocalPlayer.Character ~= character then return end
+    local s = {character = character, token = generation, binding = true, connections = {}, tracks = {}, weights = {},
+        ownTracks = setmetatable({}, {__mode = "k"}), nativeIds = {}, emoteIds = {}, jumpCount = 0, jumpedAt = -math.huge}
+    session = s
+    table.insert(s.connections, character.DescendantAdded:Connect(function(child)
+        if not valid(s) then return end
+        if (child:IsA("Animator") or child:IsA("Humanoid")) and not s.binding then
+            if not s.ready or (child:IsA("Animator") and child ~= s.animator) then
+                task.defer(function() if valid(s) then bindCharacter(character) end end)
             end
         end
-    end
-    Animate.Disabled = false
-end
-
-local function getPresetForType(animType)
-    if animState[animType] ~= "Default" then return animState[animType] end
-    if animState.all ~= "Default" then return animState.all end
-    return "Default"
-end
-
--- Coalesce startup dropdown restoration and quick edits into one worker.
--- A stopped execution cannot overwrite animations applied by its replacement.
-local function applyAnimations()
-    if not alive or not runtimeAlive or not feAnimEnabled then return end
-    if LocalPlayer.Character ~= originalCharacter then return end
-    updateSerial = updateSerial + 1
-    if applyRunning then return end
-    applyRunning = true
+    end))
     task.spawn(function()
-        while alive and runtimeAlive and feAnimEnabled do
-            local character = LocalPlayer.Character
-            if character ~= originalCharacter then break end
-            local Animate = character and character:FindFirstChild("Animate")
-            if not Animate then break end
-            local serial, token = updateSerial, spawnToken
-            local ownership = {}
-            stopAllAnimations(character)
-            Animate.Disabled = true
-            applyingScripts[Animate] = ownership
-            task.wait(0.1)
-            if applyingScripts[Animate] == ownership then
-                if isCurrentSpawn(character, token) and serial == updateSerial then
-                    local humanoid = character:FindFirstChildOfClass("Humanoid")
-                    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
-                    for animType, info in pairs(animMap) do
-                        local presetName = getPresetForType(animType)
-                        local preset = animPresets[presetName]
-                        local folder = Animate:FindFirstChild(info.folder)
-                        if folder then
-                            for _, slot in ipairs(info.slots) do
-                                local anim = folder:FindFirstChild(slot.child)
-                                local newId = originalAnims[slot.origKey]
-                                if presetName == "Custom" then
-                                    local customId = customAnims[slot.origKey]
-                                    if customId and customId ~= "" then
-                                        newId = "rbxassetid://" .. customId
-                                    end
-                                elseif preset and preset[slot.origKey] then
-                                    newId = preset[slot.origKey]
-                                end
-                                if anim and newId then
-                                    anim.AnimationId = newId
-                                    if (animType == "jump" or animType == "fall") and animator then
-                                        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-                                            if track.Animation and track.Animation.AnimationId == newId then
-                                                track:Stop(0)
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                        end
+        local humanoid = character:WaitForChild("Humanoid", 10)
+        if not humanoid or not valid(s) then s.binding = false; return end
+        local animator = humanoid:FindFirstChildOfClass("Animator") or humanoid:WaitForChild("Animator", 10)
+        if not animator or not valid(s) then s.binding = false; return end
+        s.humanoid, s.animator = humanoid, animator
+        s.references = Instance.new("LocalScript")
+        s.references.Name = "VisualsV2_FEAnimationReferences"; s.references.Disabled = true
+        s.references.Parent = character
+        collectNativeIds(s)
+        s.ready, s.binding = true, false
+        if humanoid:GetState() == Enum.HumanoidStateType.Jumping then s.jumpedAt = os.clock(); s.jumpCount = 1 end
+        local function connect(event, callback) table.insert(s.connections, event:Connect(callback)) end
+        connect(humanoid.Running, function(speed) s.runSpeed = speed; updateMotion(s) end)
+        connect(humanoid.Climbing, function(speed) s.climbSpeed = speed; updateMotion(s) end)
+        connect(humanoid.Swimming, function(speed) s.swimSpeed = speed; updateMotion(s) end)
+        connect(humanoid.StateChanged, function(_, state)
+            if state == Enum.HumanoidStateType.Jumping then s.jumpedAt = os.clock(); s.jumpCount = s.jumpCount + 1 end
+            updateMotion(s)
+        end)
+        connect(humanoid.Died, function() if session == s then closeSession() end end)
+        connect(character.DescendantAdded, function(child)
+            if child:IsA("Animation") and not child:IsDescendantOf(s.references) then
+                local group = animationGroup(child, character)
+                local id = cleanAnimationId(child.AnimationId)
+                if group and aliases[group] and id then s.nativeIds[id] = aliases[group] end
+            end
+        end)
+        local elapsed = 0
+        connect(RunService.Heartbeat, function(dt)
+            elapsed = elapsed + dt
+            if elapsed < 0.1 then return end
+            elapsed = 0
+            updateMotion(s)
+        end)
+        refreshTargets(s)
+        task.spawn(function()
+            local ok, description = pcall(function() return humanoid:GetAppliedDescription() end)
+            if not ok or not description or not valid(s) then return end
+            local success, emotes = pcall(function() return description:GetEmotes() end)
+            if success and type(emotes) == "table" then
+                for _, ids in pairs(emotes) do
+                    if type(ids) == "table" then
+                        for _, id in ipairs(ids) do local value = cleanAnimationId(id); if value then s.emoteIds[value] = true end end
                     end
                 end
-                Animate.Disabled = false
-                applyingScripts[Animate] = nil
             end
-            if serial == updateSerial then break end
-        end
-        applyRunning = false
+        end)
     end)
 end
-
-local function applyOnSpawn(character, token)
-    local humanoid = character:WaitForChild("Humanoid", 10)
-    if not humanoid or humanoid.RigType ~= Enum.HumanoidRigType.R15
-        or not isCurrentSpawn(character, token) then return end
-    if not waitForAnimateReady(character, token, 10) then return end
-    if not isCurrentSpawn(character, token) or not saveOriginalAnimations(character) then return end
-    applyAnimations()
-    task.wait(0.5)
-    if isCurrentSpawn(character, token) then applyAnimations() end
-end
-
-local function queueCharacter(character)
-    spawnToken = spawnToken + 1
-    updateSerial = updateSerial + 1
-    local token = spawnToken
-    releaseAnimationScripts()
-    originalCharacter, originalAnims = nil, {}
-    task.spawn(applyOnSpawn, character, token)
-end
-
-local function enableFEAnims()
-    FEAnimMaid:DoCleaning()
-    FEAnimMaid = Maid.new()
-    FEAnimMaid:GiveTask(LocalPlayer.CharacterAdded:Connect(queueCharacter))
-    FEAnimMaid:GiveTask(LocalPlayer.CharacterRemoving:Connect(function(character)
-        spawnToken = spawnToken + 1
-        updateSerial = updateSerial + 1
-        releaseAnimationScripts()
-        restoreDefaultAnimations(character)
-        originalCharacter, originalAnims = nil, {}
-    end))
-    if LocalPlayer.Character then queueCharacter(LocalPlayer.Character) end
-end
-
-local function disableFEAnims()
-    spawnToken = spawnToken + 1
-    updateSerial = updateSerial + 1
-    FEAnimMaid:DoCleaning()
-    FEAnimMaid = Maid.new()
-    releaseAnimationScripts()
-    restoreDefaultAnimations()
-    -- Keep presets and custom IDs when toggled off so re-execution restores them.
-end
-
-local feAnimToggle = addToggle(feAnimSection, "Enable FE Anims", feAnimEnabled, function(enabled)
+refreshRuntime = function()
     if not alive or not runtimeAlive then return end
-    feAnimEnabled = enabled
-    SetCfg("feAnimEnabled", enabled)
-    if enabled then enableFEAnims() else disableFEAnims() end
-end)
+    if not enabled() then closeSession(); return end
+    local character = LocalPlayer.Character
+    if not character then return end
+    if session and session.character == character and (session.ready or session.binding) then
+        refreshTargets(session)
+    else
+        bindCharacter(character)
+    end
+end
+RootMaid:GiveTask(LocalPlayer.CharacterAdded:Connect(function(character)
+    if alive and runtimeAlive and enabled() then bindCharacter(character) end
+end))
+RootMaid:GiveTask(LocalPlayer.CharacterRemoving:Connect(function(character)
+    if session and session.character == character then closeSession() end
+end))
+RootMaid:GiveTask(closeSession)
 
+local presetToggle = addToggle(feAnimSection, "Enable Preset Animations", presetsEnabled, function(value)
+    if not alive or not runtimeAlive then return end
+    presetsEnabled = value
+    SetCfg("feAnimPresetsEnabled", value); SetCfg("feAnimEnabled", enabled())
+    refreshRuntime()
+end)
 local presetControllers = {}
-local function addAnimationDropdown(label, animType, options)
-    presetControllers[animType] = addDropdown(feAnimSection, label, options, animState[animType], function(selected)
-        if not alive or not runtimeAlive then return end
-        if selected ~= "Default" and selected ~= "Custom" and not animPresets[selected] then return end
-        if selected == "OG Rthro Run" and animType ~= "run" then return end
-        animState[animType] = selected
-        SetCfg(presetKeys[animType], selected)
-        applyAnimations()
+local function addAnimationDropdown(label, kind, options)
+    presetControllers[kind] = addDropdown(feAnimSection, label, options, animState[kind], function(selected)
+        if not alive or not runtimeAlive or type(selected) ~= "string" then return end
+        if selected ~= "Default" and not animPresets[selected] then return end
+        if selected == "OG Rthro Run" and kind ~= "run" then return end
+        animState[kind] = selected; SetCfg(presetKeys[kind], selected)
+        refreshRuntime()
     end)
 end
 addAnimationDropdown("All Animations", "all", allAnimOptions)
-local dropdowns = {
-    {label = "Idle Animation", key = "idle"},
-    {label = "Walk Animation", key = "walk"},
-    {label = "Run Animation", key = "run"},
-    {label = "Jump Animation", key = "jump"},
-    {label = "Climb Animation", key = "climb"},
-    {label = "Fall Animation", key = "fall"},
-}
-for _, dd in ipairs(dropdowns) do
-    addAnimationDropdown(dd.label, dd.key, dd.key == "run" and runAnimOptions or allAnimOptions)
-end
-
-feAnimSection:AddLabel("Select Custom to use your saved animation IDs.")
-local function customIdDescription()
-    local lines = {}
-    for _, slot in ipairs(customSlots) do
-        local id = customAnims[slot.key]
-        table.insert(lines, slot.label .. ": " .. (id ~= "" and id or "Not set"))
-    end
-    return table.concat(lines, "\n")
-end
-local savedCustomIds = feAnimSection:AddParagraph("Saved Custom Animation IDs", customIdDescription(), true)
-local function refreshCustomIdDescription()
-    if savedCustomIds and type(savedCustomIds.SetValue) == "function" then
-        savedCustomIds:SetValue(customIdDescription())
+for _, slot in ipairs(customSlots) do
+    if slot.key ~= "swim" then
+        addAnimationDropdown(slot.label .. " Animation", slot.key, slot.key == "run" and runAnimOptions or allAnimOptions)
     end
 end
+local customToggle = addToggle(feAnimSection, "Enable Custom Animations", customEnabled, function(value)
+    if not alive or not runtimeAlive then return end
+    customEnabled = value
+    SetCfg("feAnimCustomEnabled", value); SetCfg("feAnimEnabled", enabled())
+    refreshRuntime()
+end)
 for _, slot in ipairs(customSlots) do
     feAnimSection:AddTextBox("Custom " .. slot.label .. " Animation ID", function(value)
         if not alive or not runtimeAlive then return end
         local id = cleanAnimationId(value)
-        if id == nil then
-            shared.Notify("Error: Enter an animation ID or asset URL. Leave it empty to clear it.", 0)
-            return
-        end
-        customAnims[slot.key] = id
-        SetCfg(slot.config, id)
-        refreshCustomIdDescription()
-        applyAnimations()
+        if id == nil then shared.Notify("Error: Enter an animation ID or asset URL. Leave it empty to clear it.", 0); return end
+        customAnims[slot.key] = id; SetCfg(slot.config, id)
+        refreshRuntime()
     end)
 end
 
 resetSection = function()
-    feAnimToggle:Set(false)
-    feAnimEnabled = false
-    disableFEAnims()
-    for animType in pairs(presetKeys) do
-        animState[animType] = "Default"
-        local control = presetControllers[animType]
+    presetToggle:Set(false); customToggle:Set(false)
+    presetsEnabled, customEnabled = false, false
+    closeSession()
+    for kind in pairs(presetKeys) do
+        animState[kind] = "Default"
+        local control = presetControllers[kind]
         if control and type(control.Select) == "function" then
-            pcall(function() control:Select("Default") end)
+            local ok = pcall(function() control:Select("Default") end)
+            if not ok then pcall(control.Select, "Default") end
         end
     end
     for _, slot in ipairs(customSlots) do customAnims[slot.key] = "" end
-    refreshCustomIdDescription()
 end
-RootMaid:GiveTask(function()
-    feAnimEnabled = false
-    disableFEAnims()
-end)
+if enabled() then task.defer(refreshRuntime) end
 end)()
 
 -- COSMETIC: TRAIL
