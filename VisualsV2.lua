@@ -568,7 +568,7 @@ end)()
 
 -- =========================================================
 -- COSMETIC: FE ANIMATIONS
--- Complete FE animation presets from aux0on/FE, with Visuals V2 persistence.
+-- 52 animation presets: 51 originally from 187 (aux0on/FE), plus R6 Gear Hold.
 -- =========================================================
 ;(function()
 local table_insert = table.insert
@@ -653,6 +653,8 @@ local loaderCheck = task.spawn(function()
     end
 end)
 RootMaid:GiveTask(function() pcall(task.cancel, loaderCheck) end)
+
+
 
 
 
@@ -1126,6 +1128,18 @@ local animPresets = {
                 climb = "http://www.roblox.com/asset/?id=80369171706383",
                 fall  = "http://www.roblox.com/asset/?id=130011792193300"
             },
+        
+            ["R6 Gear Hold"] = {
+                idle1 = "rbxassetid://92453281924797",
+                idle2 = "rbxassetid://89893748940721",
+                walk = "rbxassetid://114884344098450",
+                run = "rbxassetid://131634789076585",
+                jump = "rbxassetid://137659653949709",
+                fall = "rbxassetid://75834860496519",
+                climb = "rbxassetid://125215321499925",
+                swim = "rbxassetid://113534064176043",
+                swimidle = "rbxassetid://140107830121953",
+            },
         }
 
 local allAnimOptions = {
@@ -1137,7 +1151,7 @@ local allAnimOptions = {
             "Dizzy", "WDTL", "Billie Eilish", "Cute Bouncy", "Cute",
             "Jolly", "Cute Kawaii", "Doll 3.0", "Victoria Model",
             "Bike/Bicyclist", "Animal", "It-Girl Essential Model",
-            "Oldschool", "Spider", "Joy", "Flying Aura", "FHA V2", "Silent Nurse", "Supermodel", "Enchanted Fairy", "Furry", "Vlada Model", "R6 Converter"
+            "Oldschool", "Spider", "Joy", "Flying Aura", "FHA V2", "Silent Nurse", "Supermodel", "Enchanted Fairy", "Furry", "Vlada Model", "R6 Converter", "R6 Gear Hold"
         }
 
         local runAnimOptions = {
@@ -1149,12 +1163,15 @@ local allAnimOptions = {
             "Dizzy", "WDTL", "Billie Eilish", "Cute Bouncy", "Cute",
             "Jolly", "Cute Kawaii", "Doll 3.0", "Victoria Model",
             "Bike/Bicyclist", "Animal", "It-Girl Essential Model",
-            "Oldschool", "Spider", "Joy", "Flying Aura", "FHA V2", "Silent Nurse", "Supermodel", "Enchanted Fairy", "Furry", "Vlada Model", "R6 Converter"
+            "Oldschool", "Spider", "Joy", "Flying Aura", "FHA V2", "Silent Nurse", "Supermodel", "Enchanted Fairy", "Furry", "Vlada Model", "R6 Converter", "R6 Gear Hold"
         }
+local swimAnimOptions = {"Default", "R6 Gear Hold"}
+
 
 local presetKeys = {
     all = "feAnimPresetAll", idle = "feAnimPresetIdle", walk = "feAnimPresetWalk",
     run = "feAnimPresetRun", jump = "feAnimPresetJump", climb = "feAnimPresetClimb", fall = "feAnimPresetFall",
+    swim = "feAnimPresetSwim",
 }
 local customSlots = {
     {key = "idle", label = "Idle", config = "feAnimCustomIdle"},
@@ -1205,6 +1222,7 @@ local function enabled() return presetsEnabled or customEnabled end
 -- These catalog containers use separate playback clips. Presets already
 -- contain playback IDs; arbitrary custom catalog IDs are resolved on demand.
 local assetRedirects = {
+    ["103766334307435"] = "92453281924797",
     ["122068681350601"] = "114884344098450",
     ["101475660523078"] = "131634789076585",
     ["90924872939548"] = "137659653949709",
@@ -1218,14 +1236,14 @@ local aliases = {
     idle = "idle", idle1 = "idle", idle2 = "idle", animation1 = "idle", animation2 = "idle",
     walk = "walk", walkanim = "walk", run = "run", runanim = "run", jump = "jump", jumpanim = "jump",
     climb = "climb", climbanim = "climb", fall = "fall", fallanim = "fall",
-    swim = "swim", swimanim = "swim", swimidle = "swim", swimidleanim = "swim",
+    swim = "swim", swimanim = "swim", swimidle = "swimidle", swimidleanim = "swimidle",
 }
 local emoteGroups = {wave = true, point = true, dance = true, dance2 = true, dance3 = true, laugh = true, cheer = true}
 local defaultMoves = {
     ["507766666"] = "idle", ["507766951"] = "idle", ["507766388"] = "idle",
     ["507777826"] = "walk", ["507767714"] = "run", ["507765000"] = "jump",
     ["507765644"] = "climb", ["507767968"] = "fall",
-    ["507784897"] = "swim", ["507785072"] = "swim",
+    ["507784897"] = "swim", ["507785072"] = "swimidle",
     ["180435571"] = "idle", ["180435792"] = "idle", ["180426354"] = "walk",
     ["125750702"] = "jump", ["180436148"] = "climb", ["180436334"] = "fall",
 }
@@ -1249,6 +1267,7 @@ local function dropRecord(s, kind)
     local record = s.tracks[kind]
     if not record then return end
     s.tracks[kind] = nil; record.disposed = true
+    if record.loopConnection then record.loopConnection:Disconnect(); record.loopConnection = nil end
     if s.current == record then s.current = nil; restoreWeights(s) end
     if record.track then
         s.ownTracks[record.track] = nil
@@ -1314,16 +1333,31 @@ local function collectNativeIds(s)
 end
 local function playbackTargets()
     local result = {}
+    local function selectedPreset(kind)
+        if not presetsEnabled then return nil end
+        local selected = animState[kind]
+        if selected == "Default" then selected = animState.all end
+        return animPresets[selected]
+    end
     for _, slot in ipairs(customSlots) do
         local kind, id = slot.key, nil
-        if presetsEnabled and kind ~= "swim" then
-            local selected = animState[kind]
-            if selected == "Default" then selected = animState.all end
-            local preset = animPresets[selected]
-            if preset then id = cleanAnimationId(preset[kind == "idle" and "idle1" or kind]) end
-        end
+        local preset = selectedPreset(kind)
+        if preset then id = cleanAnimationId(preset[kind == "idle" and "idle1" or kind]) end
         if customEnabled and customAnims[kind] ~= "" then id = customAnims[kind] end
         if id and id ~= "" then result[kind] = assetRedirects[id] or id end
+    end
+    -- Preset idle variations do not require a second custom-id input.
+    local idlePreset = selectedPreset("idle")
+    if idlePreset and not (customEnabled and customAnims.idle ~= "") then
+        local id = cleanAnimationId(idlePreset.idle2)
+        if id and id ~= "" and id ~= result.idle then result.idle2 = assetRedirects[id] or id end
+    end
+    local swimPreset = selectedPreset("swim")
+    if customEnabled and customAnims.swim ~= "" then
+        result.swimidle = customAnims.swim == "103415879046292" and "140107830121953" or result.swim
+    elseif swimPreset then
+        local id = cleanAnimationId(swimPreset.swimidle)
+        if id and id ~= "" then result.swimidle = assetRedirects[id] or id end
     end
     return result
 end
@@ -1367,6 +1401,7 @@ local function loadRecord(s, kind)
     local function stillCurrent() return valid(s) and not record.disposed and s.tracks[kind] == record end
     local function install(playbackId)
         if not stillCurrent() then return false end
+        if record.loopConnection then record.loopConnection:Disconnect(); record.loopConnection = nil end
         if record.track then
             s.ownTracks[record.track] = nil; stopTrack(record.track)
             pcall(function() record.track:Destroy() end)
@@ -1387,6 +1422,14 @@ local function loadRecord(s, kind)
         record.track = track; s.ownTracks[track] = true
         track.Priority = Enum.AnimationPriority.Movement
         track.Looped = kind ~= "jump"
+        if kind == "idle" or kind == "idle2" then
+            record.loopConnection = track.DidLoop:Connect(function()
+                if stillCurrent() and s.current == record and s.targets.idle2 then
+                    s.idleVariant = kind == "idle" and "idle2" or "idle"
+                    updateMotion(s)
+                end
+            end)
+        end
         record.pending = false
         if s.current == record then s.current = nil end
         updateMotion(s)
@@ -1411,7 +1454,12 @@ local function loadRecord(s, kind)
         if not stillCurrent() then return end
         if resolved ~= firstId then install(resolved) end
         task.wait(6)
-        if stillCurrent() and record.track and record.track.Length == 0 then reportLoadError(s, record) end
+        if stillCurrent() and record.track and record.track.Length == 0 then
+            record.failed = true
+            stopTrack(record.track)
+            if s.current == record then s.current = nil; restoreWeights(s) end
+            reportLoadError(s, record)
+        end
     end)
     return record
 end
@@ -1423,6 +1471,9 @@ local function desiredMotion(s)
         or state == Enum.HumanoidStateType.Seated or state == Enum.HumanoidStateType.PlatformStanding
         or state == Enum.HumanoidStateType.Physics or state == Enum.HumanoidStateType.Ragdoll then return nil, 1 end
     if state == Enum.HumanoidStateType.Swimming then
+        if (s.swimSpeed or 0) < 0.5 and humanoid.MoveDirection.Magnitude < 0.01 and s.targets.swimidle then
+            return "swimidle", 1
+        end
         return "swim", math.clamp((s.swimSpeed or 0) / 10, 0.1, 3)
     end
     if state == Enum.HumanoidStateType.Climbing then return "climb", math.clamp((s.climbSpeed or 0) / 12, -3, 3) end
@@ -1433,13 +1484,15 @@ local function desiredMotion(s)
     end
     local speed = s.runSpeed or 0
     local moving = humanoid.MoveDirection.Magnitude > 0.01 or speed > 0.5
-    if not moving then return "idle", 1 end
+    if not moving then return s.idleVariant == "idle2" and s.targets.idle2 and "idle2" or "idle", 1 end
     if speed <= 0.5 then speed = humanoid.MoveDirection.Magnitude * humanoid.WalkSpeed end
     local kind = speed >= math.max(humanoid.WalkSpeed * 0.75, 1) and "run" or "walk"
     if not s.targets[kind] then kind = kind == "run" and "walk" or "run" end
     return kind, math.clamp(speed / (kind == "walk" and 8 or 16), 0.1, 3)
 end
 local function sameMovement(native, active)
+    if active == "idle2" then return native == "idle" end
+    if active == "swim" or active == "swimidle" then return native == "swim" or native == "swimidle" end
     if active == "walk" or active == "run" then return native == "walk" or native == "run" end
     if active == "fall" then return native == "fall" or native == "jump" end
     return native == active
@@ -1451,6 +1504,7 @@ updateMotion = function(s)
     for _, track in ipairs(playing) do
         if track.IsPlaying and isEmote(s, track) then kind = nil; break end
     end
+    if kind ~= "idle" and kind ~= "idle2" then s.idleVariant = nil end
     if not kind or not s.targets[kind] then
         if s.current then stopTrack(s.current.track); s.current = nil end
         restoreWeights(s); return
@@ -1468,7 +1522,11 @@ updateMotion = function(s)
     end
     local track = record.track
     if not track.IsPlaying and (kind ~= "jump" or record.lastJump ~= s.jumpCount) then
-        track:Play(0.12, 1, speed)
+        local ok = pcall(function() track:Play(0.12, 1, speed) end)
+        if not ok then
+            record.failed = true; stopTrack(track)
+            s.current = nil; restoreWeights(s); reportLoadError(s, record); return
+        end
         if kind == "jump" then record.lastJump = s.jumpCount end
     else
         track:AdjustSpeed(speed)
@@ -1498,6 +1556,8 @@ end
 local function refreshTargets(s)
     if not valid(s) or not s.ready then return end
     local targets = playbackTargets()
+    local oldTargets = s.targets or {}
+    if targets.idle ~= oldTargets.idle or targets.idle2 ~= oldTargets.idle2 then s.idleVariant = nil end
     for kind, record in pairs(s.tracks) do
         if targets[kind] ~= record.rawId then dropRecord(s, kind) end
     end
@@ -1605,9 +1665,8 @@ local function addAnimationDropdown(label, kind, options)
 end
 addAnimationDropdown("All Animations", "all", allAnimOptions)
 for _, slot in ipairs(customSlots) do
-    if slot.key ~= "swim" then
-        addAnimationDropdown(slot.label .. " Animation", slot.key, slot.key == "run" and runAnimOptions or allAnimOptions)
-    end
+    local options = slot.key == "run" and runAnimOptions or slot.key == "swim" and swimAnimOptions or allAnimOptions
+    addAnimationDropdown(slot.label .. " Animation", slot.key, options)
 end
 local customToggle = addToggle(feAnimSection, "Enable Custom Animations", customEnabled, function(value)
     if not alive or not runtimeAlive then return end
