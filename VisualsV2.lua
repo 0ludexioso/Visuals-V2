@@ -3639,13 +3639,13 @@ end)()
 
 -- =========================================================
 -- VISUALS: GUNS & KNIVES
--- Highlight-only Gun/Knife visuals so there is no tint-mode conflict.
+-- Independent gun and knife tint and chams controls.
 -- =========================================================
 
 -- =========================================================
 -- VISUALS: EQUIPPED WEAPON / TOOL CHAMS
 -- ForceField, Flat and Chromatic renderers adapted from anya_bts's Tool Chams.
--- Existing weapon/tool colour controls are reused; source colours are untouched.
+-- Chams own their colour/rainbow settings; source colours are untouched.
 -- =========================================================
 
 ;(function()
@@ -3676,17 +3676,6 @@ local function groupFor(tool)
     for _,group in ipairs(groups) do
         if group.enabled and group.matches(tool) then return group end
     end
-end
-
-local function usesOverlay(tool)
-    local group=tool and tool.Parent==player.Character and tool.Parent~=removingCharacter and groupFor(tool)
-    return group~=nil and group~=false and group.preset~="ForceField"
-end
-runtime.ChamsUsesOverlay=usesOverlay
-
-local function refreshHighlights()
-    if type(runtime.RefreshGunsKnives)=="function" then runtime.RefreshGunsKnives() end
-    if type(runtime.RefreshToolTint)=="function" then runtime.RefreshToolTint() end
 end
 
 local function clearFlat(state)
@@ -3881,10 +3870,10 @@ local function applyChromatic(tool,state,color)
         end
         model.Parent=chromWorld
         state.chrom,state.chromEntries,state.chromColor=model,entries,color
-    elseif state.chromColor~=color then
-        state.chromColor=color
-        for _,entry in ipairs(state.chromEntries) do entry[2].Color=color end
     end
+    -- Static colours and rainbow colours take the same rendering path.
+    state.chromColor=color
+    for _,entry in ipairs(state.chromEntries) do entry[2].Color=color end
 end
 
 local function applyForceField(state)
@@ -3997,7 +3986,6 @@ local function refresh()
             removingCharacter=nil
             bindCharacter(character)
             queueUpdate()
-            task.defer(function() if runtimeAlive then refreshHighlights() end end)
         end)
         lifecycleConnections[2]=player.CharacterRemoving:Connect(function(character)
             removingCharacter=character or player.Character
@@ -4011,12 +3999,23 @@ local function refresh()
         end)
     end
     update()
-    refreshHighlights()
 end
 runtime.RefreshChams=refresh
 
-runtime.RegisterChamsFeature=function(section,key,label,matches,color)
-    local group={enabled=C(key.."Enabled",false),preset=presetName(C(key.."Preset","ForceField")),matches=matches,color=color}
+runtime.RegisterChamsFeature=function(section,key,label,matches)
+    section:AddParagraph(label.." Chams","Independent of tint. Flat and Chromatic use Chams Color; ForceField keeps the original part colours.")
+    local group={
+        enabled=C(key.."Enabled",false),
+        preset=presetName(C(key.."Preset","ForceField")),
+        matches=matches,
+        colorValue=C(key.."Color",Color3.fromRGB(255,200,0)),
+        rainbow=C(key.."Rainbow",false),
+        rainbowSpeed=math.clamp(tonumber(C(key.."RainbowSpeed",3)) or 3,1,10),
+    }
+    group.color=function()
+        if group.rainbow then return Color3.fromHSV((os.clock()*(group.rainbowSpeed*0.1))%1,1,1) end
+        return group.colorValue
+    end
     groups[#groups+1]=group
     group.toggle=addToggle(section,label.." Chams",group.enabled,function(value)
         group.enabled=value
@@ -4028,6 +4027,21 @@ runtime.RegisterChamsFeature=function(section,key,label,matches,color)
         SetCfg(key.."Preset",group.preset)
         refresh()
     end)
+    section:AddColorpicker(label.." Chams Color",group.colorValue,function(color)
+        group.colorValue=color
+        SetCfg(key.."Color",color)
+        update()
+    end)
+    group.rainbowToggle=addToggle(section,"Rainbow "..label.." Chams",group.rainbow,function(value)
+        group.rainbow=value
+        SetCfg(key.."Rainbow",value)
+        update()
+    end)
+    section:AddSlider(label.." Chams Rainbow Speed",1,10,group.rainbowSpeed,function(value)
+        group.rainbowSpeed=math.clamp(tonumber(value) or 3,1,10)
+        SetCfg(key.."RainbowSpeed",group.rainbowSpeed)
+        update()
+    end)
     if group.enabled then refresh() end
 end
 
@@ -4036,7 +4050,11 @@ runtime.RegisterReset(function()
     for _,group in ipairs(groups) do
         group.enabled=false
         group.preset="ForceField"
+        group.rainbow=false
+        group.colorValue=Color3.fromRGB(255,200,0)
+        group.rainbowSpeed=3
         group.toggle:Set(false)
+        group.rainbowToggle:Set(false)
     end
     stopWatching()
     removingCharacter=nil
@@ -4046,109 +4064,156 @@ end)()
 
 ;(function()
 local section=mainTab:AddSection("Custom Knife/Gun","Visuals")
-local enabled=C("gunsVisualEnabled",false)
-local tintColor=C("gunsTintColor",Color3.fromRGB(38,38,38))
-local rainbow=C("gunsRainbow",false)
-local rainbowSpeed=C("gunsRainbowSpeed",3)
+local legacyEnabled=C("gunsVisualEnabled",false)
+local legacyColor=C("gunsTintColor",Color3.fromRGB(38,38,38))
+local legacyRainbow=C("gunsRainbow",false)
+local legacySpeed=C("gunsRainbowSpeed",3)
+local tints={}
+local highlighted=setmetatable({}, {__mode="k"})
+local watched=setmetatable({}, {__mode="k"})
+local watchConnections={}
 local rainbowConnection
 local HIGHLIGHT_NAME="VisualsV2_GunsKnivesHighlight"
 
-local function isGunKnife(tool)
-    if not tool or not tool:IsA("Tool") then return false end
-    local name=tool.Name:lower()
-    return name=="gun" or name=="knife"
-end
-local function currentColor()
-    if rainbow then return Color3.fromHSV((os.clock()*((tonumber(rainbowSpeed) or 3)*0.1))%1,1,1) end
-    return tintColor
-end
-local function removeHighlight(tool)
-    if not tool then return end
-    local h=tool:FindFirstChild(HIGHLIGHT_NAME)
-    if h then h:Destroy() end
-end
-local function applyTool(tool)
-    if not enabled or not isGunKnife(tool) then return end
-    if env.VisualsV2Runtime.ChamsUsesOverlay(tool) then removeHighlight(tool); return end
-    local h=tool:FindFirstChild(HIGHLIGHT_NAME)
-    if not h then
-        h=Instance.new("Highlight")
-        h.Name=HIGHLIGHT_NAME
-        h.Adornee=tool
-        h.DepthMode=Enum.HighlightDepthMode.Occluded
-        h.FillTransparency=0.5
-        h.OutlineTransparency=1
-        h.Parent=tool
-    end
-    h.FillColor=currentColor()
-end
 local function allTools()
     local result={}
-    for _,container in ipairs({player.Character,player:FindFirstChildOfClass("Backpack")}) do
-        if container then for _,obj in ipairs(container:GetChildren()) do if isGunKnife(obj) then table.insert(result,obj) end end end
+    local function scan(container)
+        if not container then return end
+        for _,tool in ipairs(container:GetChildren()) do
+            if tool:IsA("Tool") then
+                local name=tool.Name:lower()
+                if name=="knife" or name=="gun" then result[#result+1]=tool end
+            end
+        end
     end
+    scan(player.Character)
+    scan(player:FindFirstChildOfClass("Backpack"))
     return result
 end
-local function restoreAll()
-    if rainbowConnection then rainbowConnection:Disconnect(); rainbowConnection=nil end
-    for _,tool in ipairs(allTools()) do removeHighlight(tool) end
+
+local function removeHighlight(tool)
+    local highlight=tool and tool:FindFirstChild(HIGHLIGHT_NAME)
+    if highlight then highlight:Destroy() end
+    highlighted[tool]=nil
 end
+
+local function colorNow(tint)
+    if tint.rainbow then
+        return Color3.fromHSV((os.clock()*(tint.speed*0.1))%1,1,1)
+    end
+    return tint.color
+end
+
+local function applyTool(tool)
+    if not tool or not tool:IsA("Tool") then return end
+    local tint=tints[tool.Name:lower()]
+    if not tint then return end
+    if not tint.enabled then removeHighlight(tool); return end
+    local highlight=tool:FindFirstChild(HIGHLIGHT_NAME)
+    if not highlight then
+        highlight=Instance.new("Highlight")
+        highlight.Name=HIGHLIGHT_NAME
+        highlight.Adornee=tool
+        highlight.DepthMode=Enum.HighlightDepthMode.Occluded
+        highlight.FillTransparency=0.5
+        highlight.OutlineTransparency=1
+        highlight.Parent=tool
+    end
+    highlight.FillColor=colorNow(tint)
+    highlighted[tool]=true
+end
+
 local function applyAll()
+    if not runtimeAlive then return end
     for _,tool in ipairs(allTools()) do applyTool(tool) end
 end
+
 local function refresh()
-    restoreAll()
-    if enabled then applyAll() end
-    if enabled and rainbow then
-        rainbowConnection=RunService.RenderStepped:Connect(applyAll)
+    if rainbowConnection then rainbowConnection:Disconnect(); rainbowConnection=nil end
+    if not runtimeAlive then return end
+    applyAll()
+    for _,tint in pairs(tints) do
+        if tint.enabled and tint.rainbow then
+            rainbowConnection=RunService.RenderStepped:Connect(applyAll)
+            break
+        end
     end
 end
+
 local function watch(container)
-    if not container then return end
-    container.ChildAdded:Connect(function(obj)
-        if isGunKnife(obj) and enabled then task.defer(function() applyTool(obj) end) end
+    if not container or watched[container] then return end
+    watched[container]=true
+    watchConnections[#watchConnections+1]=container.ChildAdded:Connect(function(tool)
+        if tool:IsA("Tool") then
+            task.defer(function() if runtimeAlive then applyTool(tool) end end)
+        end
     end)
 end
-watch(player:FindFirstChildOfClass("Backpack")); watch(player.Character)
-player.CharacterAdded:Connect(function(char) watch(char); if enabled then task.defer(applyAll) end end)
-
-env.VisualsV2Runtime.GunsKnivesEnabled=enabled
+watch(player.Character)
+watch(player:FindFirstChildOfClass("Backpack"))
+watchConnections[#watchConnections+1]=player.CharacterAdded:Connect(function(character)
+    watch(character)
+    task.defer(applyAll)
+end)
+watchConnections[#watchConnections+1]=player.ChildAdded:Connect(function(child)
+    if child:IsA("Backpack") then watch(child); task.defer(applyAll) end
+end)
 env.VisualsV2Runtime.RefreshGunsKnives=refresh
 
-local enabledToggle=addToggle(section,"Enable Guns & Knives Visuals",enabled,function(state)
-    enabled=state
-    SetCfg("gunsVisualEnabled",state)
-    env.VisualsV2Runtime.GunsKnivesEnabled=state
-    if state then
-        if type(env.VisualsV2Runtime.RestoreToolTintGunKnife)=="function" then pcall(env.VisualsV2Runtime.RestoreToolTintGunKnife) end
+local function addTint(key,label,name)
+    -- Seed each new setting from the former shared controls once. Subsequent
+    -- executions use each weapon's own saved settings.
+    local tint={
+        enabled=C(key.."Enabled",legacyEnabled),
+        color=C(key.."Color",legacyColor),
+        rainbow=C(key.."Rainbow",legacyRainbow),
+        speed=math.clamp(tonumber(C(key.."RainbowSpeed",legacySpeed)) or 3,1,10),
+    }
+    tints[name]=tint
+    section:AddParagraph(label.." Tint","Tint controls affect only your "..name..". Chams have separate colour and rainbow controls.")
+    tint.toggle=addToggle(section,"Enable "..label.." Tint",tint.enabled,function(value)
+        tint.enabled=value
+        SetCfg(key.."Enabled",value)
         refresh()
-    else
-        restoreAll()
-        if type(env.VisualsV2Runtime.RefreshToolTint)=="function" then pcall(env.VisualsV2Runtime.RefreshToolTint) end
-    end
-end)
-section:AddColorpicker("Highlight Color",tintColor,function(color)
-    tintColor=color; SetCfg("gunsTintColor",color); if enabled and not rainbow then applyAll() end
-end)
-local rainbowToggle=addToggle(section,"Rainbow",rainbow,function(state)
-    rainbow=state; SetCfg("gunsRainbow",state); refresh()
-end)
-section:AddSlider("Rainbow Speed",1,10,rainbowSpeed,function(value)
-    rainbowSpeed=math.clamp(tonumber(value) or 3,1,10); SetCfg("gunsRainbowSpeed",rainbowSpeed)
-end)
+    end)
+    section:AddColorpicker(label.." Tint Color",tint.color,function(color)
+        tint.color=color
+        SetCfg(key.."Color",color)
+        applyAll()
+    end)
+    tint.rainbowToggle=addToggle(section,"Rainbow "..label.." Tint",tint.rainbow,function(value)
+        tint.rainbow=value
+        SetCfg(key.."Rainbow",value)
+        refresh()
+    end)
+    section:AddSlider(label.." Tint Rainbow Speed",1,10,tint.speed,function(value)
+        tint.speed=math.clamp(tonumber(value) or 3,1,10)
+        SetCfg(key.."RainbowSpeed",tint.speed)
+        applyAll()
+    end)
+end
 
-section:AddParagraph("Weapon Chams","Applies to equipped local knives and guns. Chams reuse Highlight Color and Rainbow; ForceField preserves the original part colours.")
-env.VisualsV2Runtime.RegisterChamsFeature(section,"knifeChams","Knife",function(tool) return tool.Name:lower()=="knife" end,currentColor)
-env.VisualsV2Runtime.RegisterChamsFeature(section,"gunChams","Gun",function(tool) return tool.Name:lower()=="gun" end,currentColor)
+addTint("knifeTint","Knife","knife")
+env.VisualsV2Runtime.RegisterChamsFeature(section,"knifeChams","Knife",function(tool) return tool.Name:lower()=="knife" end)
+addTint("gunTint","Gun","gun")
+env.VisualsV2Runtime.RegisterChamsFeature(section,"gunChams","Gun",function(tool) return tool.Name:lower()=="gun" end)
 
 env.VisualsV2Runtime.RegisterReset(function()
-    enabledToggle:Set(false); rainbowToggle:Set(false)
-    enabled=false; rainbow=false; tintColor=Color3.fromRGB(255,255,255); rainbowSpeed=3
-    env.VisualsV2Runtime.GunsKnivesEnabled=false
-    restoreAll()
-    if type(env.VisualsV2Runtime.RefreshToolTint)=="function" then pcall(env.VisualsV2Runtime.RefreshToolTint) end
+    for _,tint in pairs(tints) do
+        tint.enabled=false; tint.rainbow=false
+        tint.toggle:Set(false); tint.rainbowToggle:Set(false)
+        tint.color=Color3.fromRGB(38,38,38); tint.speed=3
+    end
+    if rainbowConnection then rainbowConnection:Disconnect(); rainbowConnection=nil end
+    for _,tool in ipairs(allTools()) do removeHighlight(tool) end
+    for tool in pairs(highlighted) do removeHighlight(tool) end
+    if not runtimeAlive then
+        for _,connection in ipairs(watchConnections) do connection:Disconnect() end
+        table.clear(watchConnections)
+        table.clear(watched)
+    end
 end)
-if enabled then task.defer(refresh) end
+task.defer(refresh)
 end)()
 
 -- =========================================================
@@ -4413,7 +4478,7 @@ end)()
 
 ;(function()
 local section=mainTab:AddSection("Custom Tool","Visuals")
-section:AddParagraph("Tool Tint","Applies a configurable highlight tint to Roblox tools.")
+section:AddParagraph("Tool Tint","Applies a configurable highlight tint to tools other than Gun and Knife.")
 local enabled=C("toolTintEnabled",false)
 local tintColor=C("toolTintColor",Color3.fromRGB(38,38,38))
 local rainbow=C("toolTintRainbow",false)
@@ -4422,11 +4487,23 @@ local transparency=C("toolTintTransparency",5)
 local rainbowConn
 local HIGHLIGHT_NAME="VisualsV2_ToolTint"
 
+local function isGunKnife(tool)
+    if not tool or not tool:IsA("Tool") then return false end
+    local name=tool.Name:lower()
+    return name=="gun" or name=="knife"
+end
+
 local function allTools()
     local result={}
-    for _,container in ipairs({player.Character,player:FindFirstChildOfClass("Backpack")}) do
-        if container then for _,obj in ipairs(container:GetChildren()) do if obj:IsA("Tool") then table.insert(result,obj) end end end
+    local function scan(container)
+        if container then
+            for _,obj in ipairs(container:GetChildren()) do
+                if obj:IsA("Tool") and not isGunKnife(obj) then result[#result+1]=obj end
+            end
+        end
     end
+    scan(player.Character)
+    scan(player:FindFirstChildOfClass("Backpack"))
     return result
 end
 local function colorNow()
@@ -4442,19 +4519,10 @@ local function removeHighlight(tool)
     local h=tool:FindFirstChild(HIGHLIGHT_NAME)
     if h then h:Destroy() end
 end
-local function isGunKnife(tool)
-    if not tool or not tool:IsA("Tool") then return false end
-    local name=tool.Name:lower()
-    return name=="gun" or name=="knife"
-end
 
 local function apply(tool)
     if not enabled or not tool or not tool:IsA("Tool") then return end
-    if env.VisualsV2Runtime.ChamsUsesOverlay(tool) then removeHighlight(tool); return end
-    if env.VisualsV2Runtime.GunsKnivesEnabled and isGunKnife(tool) then
-        removeHighlight(tool)
-        return
-    end
+    if isGunKnife(tool) then removeHighlight(tool); return end
     local h=tool:FindFirstChild(HIGHLIGHT_NAME)
     if not h then
         h=Instance.new("Highlight")
@@ -4485,19 +4553,11 @@ watch(player:FindFirstChildOfClass("Backpack")); watch(player.Character)
 player.CharacterAdded:Connect(function(char) watch(char); if enabled then task.defer(applyAll) end end)
 
 env.VisualsV2Runtime.RefreshToolTint=refreshAll
-env.VisualsV2Runtime.RestoreToolTintGunKnife=function()
-    for _,tool in ipairs(allTools()) do
-        if isGunKnife(tool) then removeHighlight(tool) end
-    end
-end
 
 local enabledToggle=addToggle(section,"Enable Tool Tint",enabled,function(v)
     enabled=v
     SetCfg("toolTintEnabled",v)
     if v then refreshAll() else restoreAll() end
-    if type(env.VisualsV2Runtime.RefreshGunsKnives)=="function" then
-        pcall(env.VisualsV2Runtime.RefreshGunsKnives)
-    end
 end)
 section:AddColorpicker("Tool Tint Color",tintColor,function(color)
     tintColor=color; SetCfg("toolTintColor",color); if enabled and not rainbow then applyAll() end
@@ -4506,9 +4566,6 @@ local rainbowToggle=addToggle(section,"Rainbow Tool Tint",rainbow,function(v)
     rainbow=v
     SetCfg("toolTintRainbow",v)
     refreshAll()
-    if type(env.VisualsV2Runtime.RefreshGunsKnives)=="function" then
-        pcall(env.VisualsV2Runtime.RefreshGunsKnives)
-    end
 end)
 section:AddSlider("Rainbow Speed",1,10,rainbowSpeed,function(v)
     rainbowSpeed=math.clamp(tonumber(v) or 3,1,10); SetCfg("toolTintRainbowSpeed",rainbowSpeed)
@@ -4517,8 +4574,7 @@ section:AddSlider("Tint Transparency",1,10,transparency,function(v)
     transparency=math.clamp(tonumber(v) or 5,1,10); SetCfg("toolTintTransparency",transparency); if enabled then applyAll() end
 end)
 
-section:AddParagraph("Tool Chams","Applies to equipped tools other than Gun and Knife. Chams reuse Tool Tint Color and Rainbow Tool Tint; ForceField preserves the original part colours.")
-env.VisualsV2Runtime.RegisterChamsFeature(section,"toolChams","Tool",function(tool) return not isGunKnife(tool) end,colorNow)
+env.VisualsV2Runtime.RegisterChamsFeature(section,"toolChams","Tool",function(tool) return not isGunKnife(tool) end)
 
 env.VisualsV2Runtime.RegisterReset(function()
     enabledToggle:Set(false); rainbowToggle:Set(false)
