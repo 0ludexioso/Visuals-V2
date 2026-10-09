@@ -1,4 +1,7 @@
 -- Visuals V2
+-- 2026-10-09: Independent client gun/knife skins from the complete game catalog.
+-- 2026-10-09: MM2/MMV shift lock and centre aiming for throwable tools.
+-- 2026-10-09: Original MMV scopes and shared original two-hand scope hold.
 -- COMPLETE WEAPON RESTORE: latest fixes + Shoot Murderer + Guns & Knives + Gun+
 -- COMPLETE BUILD: requested add-ons + accumulated fixes
 -- Native Overdrive H addon
@@ -5196,6 +5199,1483 @@ runtime.RegisterReset(function()
     resetting=false
 end)
 end)()
+
+-- =========================================================
+-- COSMETIC: CLIENT WEAPON SKINS (MM2 / MMV)
+-- Runtime catalogs deliberately have no rarity/ownership/tradeability filter:
+-- commons, chromas, event items, trophies and developer items are all retained.
+-- Only the two default weapons are excluded. Inventory tables are read only.
+-- =========================================================
+;(function()
+local section=mainTab:AddSection("Client Gun & Knife Skins","Cosmetic")
+local RS=game:GetService("ReplicatedStorage")
+local MARKER="VisualsV2_ClientWeaponSkin"
+local NONE="None"
+local alive=true
+local refreshing=false
+local catalog={Gun={},Knife={}}
+local aliases={Gun={},Knife={}}
+local templates={Gun={},Knife={},Any={}}
+local moduleData={}
+local modulePending=setmetatable({}, {__mode="k"})
+local moduleRetry=setmetatable({}, {__mode="k"})
+local syncData=nil
+local syncPending=false
+local syncRetry=0
+local scanRunning=false
+local scanWanted=false
+local forceSync=false
+local notifyScan=false
+local scanGeneration=0
+local catalogQueued=false
+local connections={}
+local toolStates={}
+local heartbeat=nil
+local hideFrame=nil
+local requestCatalog,refreshTools,updateWatching
+local kinds={
+    Gun={enabled=C("clientGunEnabled",false),selected=tostring(C("clientGunSkin",NONE)),key="clientGun"},
+    Knife={enabled=C("clientKnifeEnabled",false),selected=tostring(C("clientKnifeSkin",NONE)),key="clientKnife"},
+}
+
+local function notify(message)
+    if alive and runtimeAlive then pcall(function() shared.Notify(message,4) end) end
+end
+
+local function compact(value)
+    return type(value)=="string" and value:lower():gsub("[^%w]","") or ""
+end
+
+local function weaponKind(value)
+    local name=compact(value)
+    if name=="gun" or name=="guns" or name=="pistol" or name=="revolver"
+        or name=="firearm" or name=="gunskins" then return "Gun" end
+    if name=="knife" or name=="knives" or name=="melee" or name=="sword"
+        or name=="knifeskins" then return "Knife" end
+end
+
+local containers={database=true,databases=true,sync=true,item=true,items=true,itemdata=true,
+    weapons=true,weapondata=true,weaponlist=true,weaponskins=true,skins=true,knives=true,
+    guns=true,knifeskins=true,gunskins=true,trophies=true,unique=true,models=true,
+    assets=true,meshes=true,season1=true,classic=true,halloween=true,christmas=true}
+local dataModules={database=true,sync=true,item=true,items=true,itemdata=true,weapons=true,
+    weapondata=true,weaponlist=true,weaponskins=true,skins=true,knives=true,guns=true,
+    knifeskins=true,gunskins=true}
+
+local function properties(data)
+    local result={}
+    if type(data)=="table" then
+        for key,value in pairs(data) do
+            if type(key)=="string" then result[compact(key)]=value end
+        end
+    end
+    return result
+end
+
+local function isDefault(id,data)
+    if data.isdefault==true or data.default==true then return true end
+    local key=compact(id)
+    if key=="default" or key=="defaultgun" or key=="defaultknife"
+        or key=="gun" or key=="knife" then return true end
+    local name=compact(data.itemname or data.displayname or data.name)
+    return name=="defaultgun" or name=="defaultknife" or name=="default"
+end
+
+local function register(kind,id,data,source)
+    if not kind or id==nil then return end
+    id=tostring(id)
+    if id=="" or isDefault(id,data) then return end
+    local entry=catalog[kind][id]
+    if not entry then
+        entry={id=id,kind=kind,data={},revision=0}
+        catalog[kind][id]=entry
+    end
+    local changed=false
+    for key,value in pairs(data) do
+        if entry.data[key]~=value then entry.data[key]=value; changed=true end
+    end
+    if source and entry.source~=source then entry.source=source; changed=true end
+    entry.name=tostring(entry.data.itemname or entry.data.displayname or entry.data.name or id)
+    if changed then entry.revision=entry.revision+1 end
+    aliases[kind][compact(id)]=entry
+    -- An ID always wins; duplicate display names remain distinct catalog entries.
+    local alias=compact(entry.name)
+    if not aliases[kind][alias] then aliases[kind][alias]=entry end
+    return entry
+end
+
+-- Original MMV ItemIDs supplied by the live Database.Sync.Item report.
+-- These are Model assets, not their inventory image IDs. Keeping them here
+-- also exposes the original MMV scopes when the current game is MM2.
+local originalScopes={
+    {"Voidscope","Voidscope","84264267520629"},
+    {"Matrixscope","Matrixscope","117266088063706"},
+    {"Gingerscope","Gingerscope","15666469505"},
+    {"Gingerscope_Blue","Blue Gingerscope","16964462231"},
+    {"Gingerscope_Bronze","Bronze Gingerscope","16964465320"},
+    {"Gingerscope_Silver","Silver Gingerscope","16964468980"},
+    {"Gingerscope_Gold","Gold Gingerscope","16964471890"},
+}
+for _,record in ipairs(originalScopes) do
+    local entry=register("Gun",record[1],{itemname=record[2],itemtype="Gun",itemid=record[3]})
+    entry.originalModelId=record[3]
+end
+-- Actual Gun.CustomHold Animation from the same report (asset name: Hold2).
+-- Never interpret numeric ItemID/Image/Year/Season fields as animations.
+local ORIGINAL_SCOPE_HOLD="134818020160275"
+local scopeHoldWarnings={}
+local nativeScopeHolds={}
+local function isScope(entry)
+    if not entry or entry.kind~="Gun" then return false end
+    local name=compact(entry.id)..compact(entry.name)
+    return name:find("gingerscope",1,true)~=nil or name:find("voidscope",1,true)~=nil
+        or name:find("matrixscope",1,true)~=nil
+end
+
+local function readTable(root,context)
+    local seen={}
+    local function visit(data,key,parentKind,depth)
+        if type(data)~="table" or seen[data] or depth>12 then return end
+        seen[data]=true
+        local fields=properties(data)
+        local kind=weaponKind(fields.itemtype or fields.weapontype or fields.type or fields.category)
+            or parentKind
+        local looksLikeItem=fields.itemname~=nil or fields.displayname~=nil or fields.model~=nil
+            or fields.modelid~=nil or fields.meshid~=nil or fields.textureid~=nil
+            or fields.assetid~=nil or fields.weapontype~=nil or fields.itemtype~=nil
+            or fields.mesh~=nil or (kind~=nil and fields.name~=nil)
+        if kind and looksLikeItem then
+            local id=fields.id or fields.key or fields.weaponid
+            if id==nil and type(key)=="string" then id=key end
+            id=id or fields.itemname or fields.name or fields.itemid or key
+            register(kind,id,fields)
+        end
+        for childKey,value in pairs(data) do
+            if type(value)=="table" then
+                -- Metadata (rarities, crafting recipes, image dictionaries, etc.)
+                -- must not inherit an item's type and become phantom weapons.
+                local childKind=weaponKind(tostring(childKey)) or (not looksLikeItem and kind or nil)
+                visit(value,childKey,childKind,depth+1)
+            end
+        end
+    end
+    visit(root,context,weaponKind(context),0)
+end
+
+local function uniqueEntry(kind,name)
+    local wanted=compact(name)
+    local candidate=aliases[kind][wanted]
+    if not candidate then return nil end
+    if compact(candidate.id)==wanted then return candidate end
+    local found=nil
+    for _,entry in pairs(catalog[kind]) do
+        if compact(entry.name)==wanted then
+            if found and found~=entry then return nil end
+            found=entry
+        end
+    end
+    return found
+end
+
+local function instanceContext(object)
+    local kind=nil
+    local inCatalog=false
+    local parent=object.Parent
+    while parent and parent~=RS do
+        local name=compact(parent.Name)
+        kind=kind or weaponKind(parent.Name)
+        if name=="weapons" or name=="weaponskins" or name=="knives" or name=="guns"
+            or name=="knifeskins" or name=="gunskins" or name=="trophies"
+            or name=="items" or name=="itemskins" or name=="assets"
+            or name=="models" or name=="meshes" then inCatalog=true end
+        parent=parent.Parent
+    end
+    return kind,inCatalog
+end
+
+local function instanceProperties(object)
+    local ok,attributes=pcall(function() return object:GetAttributes() end)
+    local data=properties(ok and attributes or {})
+    for _,child in ipairs(object:GetChildren()) do
+        if child:IsA("ValueBase") then data[compact(child.Name)]=child.Value end
+    end
+    return data
+end
+
+local function visualRoot(object)
+    if object:IsA("BasePart") then return object end
+    local handle=object:FindFirstChild("Handle",true)
+    if handle and handle:IsA("BasePart") then return handle end
+    if object:IsA("Model") and object.PrimaryPart then return object.PrimaryPart end
+    return object:FindFirstChildWhichIsA("BasePart",true)
+end
+
+local function indexTemplate(object)
+    if not (object:IsA("Tool") or object:IsA("Model") or object:IsA("BasePart")
+        or object:IsA("Folder")) or containers[compact(object.Name)] then return end
+    local inherited,inCatalog=instanceContext(object)
+    if not inCatalog then return end
+    -- Only the outer weapon is an entry, never its Handle/blade/sub-models.
+    local parent=object.Parent
+    if parent and not containers[compact(parent.Name)] and (parent:IsA("Tool")
+        or parent:IsA("Model") or parent:IsA("BasePart")) then return end
+    if not visualRoot(object) then return end
+    local data=instanceProperties(object)
+    local id=tostring(data.skinid or data.weaponid or data.itemid or data.id or object.Name)
+    local kind=weaponKind(data.itemtype or data.weapontype or data.type) or inherited
+    local templateIndex=templates[kind or "Any"]
+    templateIndex[compact(object.Name)]=object
+    templateIndex[compact(id)]=object
+    if not kind then
+        for _,candidate in ipairs({"Gun","Knife"}) do
+            local entry=catalog[candidate][id] or uniqueEntry(candidate,object.Name)
+            if entry then register(candidate,entry.id,{},object); return end
+        end
+        -- A generic Weapons folder can still expose type through its Tool name.
+        kind=object:IsA("Tool") and weaponKind(object.Name) or nil
+    end
+    if kind then
+        local entry=catalog[kind][id]
+        if not entry and not data.itemid and not data.id then entry=uniqueEntry(kind,object.Name) end
+        register(kind,entry and entry.id or id,data,object)
+    end
+end
+
+local function loadModule(module)
+    if moduleData[module] then readTable(moduleData[module],module.Name); return end
+    if modulePending[module] or (moduleRetry[module] or 0)>os.clock() then return end
+    modulePending[module]=true
+    task.spawn(function()
+        local ok,result=pcall(require,module)
+        modulePending[module]=nil
+        if not alive or not runtimeAlive then return end
+        if ok and type(result)=="table" then
+            moduleData[module]=result
+            readTable(result,module.Name)
+            requestCatalog(false,false)
+        else moduleRetry[module]=os.clock()+10 end
+    end)
+end
+
+local function loadSync(force)
+    if syncData then readTable(syncData) end
+    if syncPending or (not force and syncData) or syncRetry>os.clock() then return end
+    local remote=RS:FindFirstChild("GetSyncData",true)
+    if not remote or not remote:IsA("RemoteFunction") then return end
+    syncPending=true
+    syncRetry=os.clock()+10
+    task.spawn(function()
+        -- This is the game's read-only database request, never Equip/Trade/Save.
+        local ok,result=pcall(function() return remote:InvokeServer() end)
+        syncPending=false
+        if not alive or not runtimeAlive then return end
+        if ok and type(result)=="table" then
+            syncData=result
+            readTable(result)
+            requestCatalog(false,false)
+        end
+    end)
+end
+
+local function setDropdown(controller,method,value)
+    if type(controller)~="table" or type(controller[method])~="function" then return end
+    local ok=pcall(controller[method],value)
+    if not ok then pcall(controller[method],controller,value) end
+end
+
+local function redrawCatalog()
+    refreshing=true
+    for kind,state in pairs(kinds) do
+        local entries={}
+        for _,entry in pairs(catalog[kind]) do entries[#entries+1]=entry end
+        table.sort(entries,function(a,b)
+            if a.name:lower()==b.name:lower() then return a.id<b.id end
+            return a.name:lower()<b.name:lower()
+        end)
+        local options={NONE}
+        local labels={}
+        for _,entry in ipairs(entries) do
+            local rarity=entry.data.rarity
+            local label=entry.name..(type(rarity)=="string" and " — "..rarity or "").." ["..entry.id.."]"
+            options[#options+1]=label
+            labels[label]=entry.id
+            entry.label=label
+        end
+        state.labels=labels
+        local signature=table.concat(options,"\n")
+        if signature~=state.signature then
+            state.signature=signature
+            setDropdown(state.dropdown,"Change",options)
+        end
+        local selected=catalog[kind][state.selected]
+        -- A skin saved in the other game is retained until that game loads it.
+        setDropdown(state.dropdown,"Select",selected and selected.label or NONE)
+    end
+    refreshing=false
+end
+
+requestCatalog=function(force,showCount)
+    if not alive or not runtimeAlive then return end
+    forceSync=forceSync or force
+    notifyScan=notifyScan or showCount
+    scanWanted=true
+    if scanRunning then return end
+    scanRunning=true
+    local generation=scanGeneration
+    task.spawn(function()
+        while alive and runtimeAlive and generation==scanGeneration and scanWanted do
+            scanWanted=false
+            local forceNow=forceSync
+            forceSync=false
+            local descendants=RS:GetDescendants()
+            for index,object in ipairs(descendants) do
+                if not alive or not runtimeAlive or generation~=scanGeneration then break end
+                if object:IsA("ModuleScript") then
+                    local parent=object.Parent
+                    local parentName=parent and compact(parent.Name) or ""
+                    local itemModule=parent and (parent:IsA("Folder") or parent:IsA("ModuleScript"))
+                        and (parentName=="items" or parentName=="item" or parentName=="weapons"
+                            or parentName=="weapondata" or weaponKind(parent.Name)~=nil)
+                    if dataModules[compact(object.Name)] or itemModule then loadModule(object) end
+                end
+                if index%250==0 then task.wait() end
+            end
+            if not alive or not runtimeAlive or generation~=scanGeneration then break end
+            loadSync(forceNow)
+            for index,object in ipairs(descendants) do
+                if not alive or not runtimeAlive or generation~=scanGeneration then break end
+                indexTemplate(object)
+                if index%250==0 then task.wait() end
+            end
+            if alive and runtimeAlive and generation==scanGeneration then
+                redrawCatalog()
+                refreshTools()
+                if notifyScan then
+                    notifyScan=false
+                    local gunCount,knifeCount=0,0
+                    for _ in pairs(catalog.Gun) do gunCount=gunCount+1 end
+                    for _ in pairs(catalog.Knife) do knifeCount=knifeCount+1 end
+                    notify("Weapon list: "..gunCount.." guns / "..knifeCount.." knives (defaults excluded)")
+                end
+            end
+        end
+        scanRunning=false
+    end)
+end
+
+local function cloneObject(source)
+    local previous=source.Archivable
+    pcall(function() source.Archivable=true end)
+    local ok,clone=pcall(function() return source:Clone() end)
+    pcall(function() source.Archivable=previous end)
+    return ok and clone or nil
+end
+
+local function assetId(value)
+    if type(value)=="number" and value>0 then return tostring(math.floor(value)) end
+    if type(value)=="string" then
+        return value:match("^%s*(%d+)%s*$") or value:match("rbxassetid://(%d+)")
+            or value:match("[?&]id=(%d+)")
+    end
+end
+
+local function originalHold(container)
+    if not container then return nil end
+    for _,object in ipairs(container:GetDescendants()) do
+        if object:IsA("Animation") then
+            local name=compact(object.Name)
+            if name=="customhold" or name=="scopehold" or name=="gingerscopehold" or name=="hold2" then
+                local marked=false
+                local ancestor=object
+                while ancestor and ancestor~=container do
+                    if ancestor:GetAttribute(MARKER) then marked=true; break end
+                    ancestor=ancestor.Parent
+                end
+                local id=not marked and assetId(object.AnimationId)
+                if id then return id end
+            end
+        end
+    end
+end
+
+local function vector(value,fallback)
+    if typeof(value)=="Vector3" then return value end
+    if type(value)=="table" then
+        local x,y,z=tonumber(value.X or value.x or value[1]),tonumber(value.Y or value.y or value[2]),tonumber(value.Z or value.z or value[3])
+        if x and y and z then return Vector3.new(x,y,z) end
+    end
+    return fallback
+end
+
+local function buildTemplate(entry)
+    local data=entry.data
+    local modelData=type(data.model)=="table" and properties(data.model) or data
+    local source=entry.source
+    if not source then
+        for _,name in ipairs({entry.id,tostring(data.model or ""),tostring(data.modelname or "")}) do
+            source=templates[entry.kind][compact(name)] or templates.Any[compact(name)]
+            if source then break end
+        end
+    end
+    if not source and typeof(data.model)=="Instance" then source=data.model end
+    if not source and typeof(data.handle)=="Instance" then source=data.handle end
+    -- Names can repeat across seasons/trophies. Prefer the record's actual
+    -- model/mesh asset and never silently substitute another variant by name.
+    if not source and not (data.meshid or modelData.meshid or data.modelid or data.assetid
+        or assetId(data.model) or assetId(data.itemid)) and uniqueEntry(entry.kind,entry.name)==entry then
+        source=templates[entry.kind][compact(entry.name)] or templates.Any[compact(entry.name)]
+    end
+    local loaded={}
+    local clone=source and cloneObject(source) or nil
+    if not clone then
+        local primaryId=assetId(data.modelid) or assetId(data.assetid) or assetId(data.weaponasset)
+            or assetId(data.model) or assetId(data.itemid)
+        local ids={}
+        if primaryId then ids[#ids+1]=primaryId end
+        if entry.originalModelId and entry.originalModelId~=primaryId then ids[#ids+1]=entry.originalModelId end
+        for _,id in ipairs(ids) do
+            local ok,objects=pcall(function() return game:GetObjects("rbxassetid://"..id) end)
+            if ok and type(objects)=="table" then
+                for _,object in ipairs(objects) do
+                    loaded[#loaded+1]=object
+                    if not clone and visualRoot(object) then clone=object end
+                end
+            end
+            if clone then break end
+        end
+    end
+    if not clone then
+        local meshId=assetId(modelData.meshid or data.meshid or modelData.mesh)
+        if meshId then
+            local part=Instance.new("Part")
+            part.Name="Handle"
+            part.Size=vector(modelData.size or data.size,Vector3.new(1,1,1))
+            local mesh=Instance.new("SpecialMesh")
+            mesh.MeshType=Enum.MeshType.FileMesh
+            mesh.MeshId="rbxassetid://"..meshId
+            local texture=assetId(modelData.textureid or modelData.texture or data.textureid or data.texture)
+            mesh.TextureId=texture and "rbxassetid://"..texture or ""
+            mesh.Scale=vector(modelData.meshscale or modelData.scale or data.meshscale,Vector3.new(1,1,1))
+            mesh.Offset=vector(modelData.offset,Vector3.new())
+            mesh.Parent=part
+            if typeof(modelData.color or data.color)=="Color3" then part.Color=modelData.color or data.color end
+            clone=part
+        end
+    end
+    for _,object in ipairs(loaded) do if object~=clone then pcall(function() object:Destroy() end) end end
+    if not clone then return nil,"The game did not expose a loadable model for "..entry.name end
+    local root=visualRoot(clone)
+    if not root then clone:Destroy(); return nil,"No weapon mesh was found for "..entry.name end
+    local texture=assetId(modelData.textureid or modelData.texture or data.textureid or data.texture)
+    if texture then
+        local mesh=root:FindFirstChildWhichIsA("SpecialMesh")
+        if mesh then mesh.TextureId="rbxassetid://"..texture end
+        if root:IsA("MeshPart") then root.TextureID="rbxassetid://"..texture end
+    end
+    local grip=typeof(data.grip)=="CFrame" and data.grip or nil
+    local scopeHold=isScope(entry) and originalHold(clone) or nil
+    if clone:IsA("Tool") then grip=clone.Grip end
+    local ancestor=root.Parent
+    while ancestor and ancestor~=clone do
+        if ancestor:IsA("Tool") then grip=ancestor.Grip; break end
+        ancestor=ancestor.Parent
+    end
+    -- Keep visual assets and their attachments/PBR/bones. Never run an asset's
+    -- scripts, remotes, physical joints, sounds or interaction objects.
+    local allowed={Model=true,Folder=true,Attachment=true,Bone=true,SurfaceAppearance=true,
+        Tool=true,WrapLayer=true,WrapTarget=true,ParticleEmitter=true,Trail=true,Beam=true,Fire=true,
+        Smoke=true,Sparkles=true,PointLight=true,SpotLight=true,SurfaceLight=true}
+    for _,object in ipairs(clone:GetDescendants()) do
+        if not object:IsA("BasePart") and not object:IsA("DataModelMesh")
+            and not object:IsA("Decal") and not allowed[object.ClassName] then object:Destroy() end
+    end
+    for _,object in ipairs(clone:GetDescendants()) do
+        if object:IsA("Tool") then
+            local parent=object.Parent
+            for _,child in ipairs(object:GetChildren()) do child.Parent=parent end
+            object:Destroy()
+        end
+    end
+    local model=Instance.new("Model")
+    model.Name="VisualsV2_ClientWeaponTemplate"
+    model:SetAttribute(MARKER,true)
+    if clone:IsA("BasePart") then clone.Parent=model
+    else
+        for _,object in ipairs(clone:GetChildren()) do object.Parent=model end
+        clone:Destroy()
+    end
+    if not root:IsDescendantOf(model) then model:Destroy(); return nil,"The weapon Handle is unavailable" end
+    model.PrimaryPart=root
+    return {model=model,root=root,grip=grip,scopeHold=scopeHold,revision=entry.revision,lastUsed=os.clock()}
+end
+
+local cache={}
+local loading={}
+local failed={}
+local warned={}
+local function cacheKey(entry) return entry.kind..":"..entry.id end
+
+local function templateFor(entry)
+    local key=cacheKey(entry)
+    local cached=cache[key]
+    if cached and cached.revision==entry.revision then cached.lastUsed=os.clock(); return cached end
+    if cached then cached.model:Destroy(); cache[key]=nil end
+    local failure=failed[key]
+    if loading[key] or (failure and failure.revision==entry.revision and failure.untilTime>os.clock()) then return nil end
+    if failure and failure.revision~=entry.revision then warned[key]=nil end
+    loading[key]=true
+    local startedRevision=entry.revision
+    task.spawn(function()
+        local ok,result,reason=pcall(buildTemplate,entry)
+        loading[key]=nil
+        if not alive or not runtimeAlive then
+            if ok and result then result.model:Destroy() end
+            return
+        end
+        if entry.revision~=startedRevision then
+            if ok and result then result.model:Destroy() end
+            task.defer(refreshTools)
+            return
+        end
+        if ok and result then
+            failed[key]=nil
+            warned[key]=nil
+            cache[key]=result
+            local count=0
+            for _ in pairs(cache) do count=count+1 end
+            if count>6 then
+                local oldestKey,oldestTime=nil,math.huge
+                for candidate,value in pairs(cache) do
+                    local selected=false
+                    for _,state in pairs(kinds) do
+                        if candidate==state.key:gsub("^client","")..":"..state.selected then selected=true end
+                    end
+                    if not selected and value.lastUsed<oldestTime then oldestKey,oldestTime=candidate,value.lastUsed end
+                end
+                if oldestKey then cache[oldestKey].model:Destroy(); cache[oldestKey]=nil end
+            end
+            refreshTools()
+        else
+            failed[key]={untilTime=os.clock()+15,revision=entry.revision}
+            local state=kinds[entry.kind]
+            if state.enabled and state.selected==entry.id and not warned[key] then
+                warned[key]=true
+                notify(reason or "Could not load "..entry.name.."; your original weapon is still available")
+            end
+        end
+    end)
+    return cache[key]
+end
+
+local function owned(object,tool)
+    while object and object~=tool do
+        if object:GetAttribute(MARKER) then return true end
+        object=object.Parent
+    end
+    return false
+end
+
+local function stopScopeHold(state)
+    state.holdGeneration=(state.holdGeneration or 0)+1
+    state.holdPending=nil
+    local hold=state.hold
+    state.hold=nil
+    if not hold then return end
+    if hold.died then hold.died:Disconnect() end
+    for track,weight in pairs(hold.suppressed) do
+        pcall(function() if track.IsPlaying then track:AdjustWeight(weight,0.12) end end)
+    end
+    if hold.owned then
+        pcall(function() hold.track:Stop(0.12) end)
+        pcall(function() hold.track:Destroy() end)
+    end
+    if hold.animation then hold.animation:Destroy() end
+end
+
+local function playingTracks(animator)
+    local ok,tracks=pcall(function() return animator:GetPlayingAnimationTracks() end)
+    return ok and tracks or {}
+end
+
+local function suppressToolHold(tool,hold)
+    local ids={}
+    local nativeId=originalHold(tool)
+    if nativeId then ids[nativeId]=true end
+    local animate=player.Character and player.Character:FindFirstChild("Animate")
+    local toolNone=animate and animate:FindFirstChild("toolnone")
+    if toolNone then
+        for _,animation in ipairs(toolNone:GetDescendants()) do
+            if animation:IsA("Animation") then
+                local id=assetId(animation.AnimationId)
+                if id then ids[id]=true end
+            end
+        end
+    end
+    for _,track in ipairs(playingTracks(hold.animator)) do
+        local animation=track.Animation
+        if track~=hold.track and animation and ids[assetId(animation.AnimationId)] then
+            -- Affect only the competing tool-hold clips, preserving movement,
+            -- emotes, the gun's firing/reloading and all unrelated animations.
+            if hold.suppressed[track]==nil then
+                hold.suppressed[track]=tonumber(track.WeightTarget) or tonumber(track.WeightCurrent) or 1
+            end
+            pcall(function() track:AdjustWeight(0,0.08) end)
+        end
+    end
+end
+
+local function updateScopeHold(tool,state,entry)
+    local character=player.Character
+    local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+    local animator=humanoid and humanoid:FindFirstChildOfClass("Animator")
+    if not isScope(entry) or tool.Parent~=character or not state.model or not animator
+        or humanoid.Health<=0 then
+        if state.hold or state.holdPending then stopScopeHold(state) end
+        return
+    end
+    local rig=tostring(humanoid.RigType)
+    local mmv=game.GameId==10413186812 or game.PlaceId==93017634738276
+    local nativeId=originalHold(tool) or (not nativeScopeHolds[rig] and state.scopeTemplateHold)
+    if nativeId and not mmv then nativeScopeHolds[rig]=nativeId end
+    -- MMV uses the confirmed shared Hold2 clip for every scope variant.
+    -- MM2 can supply its own authorized original CustomHold; share that clip
+    -- across the other colours/trophies instead of changing it per model.
+    local id=not mmv and nativeScopeHolds[rig] or ORIGINAL_SCOPE_HOLD
+    id=id or ORIGINAL_SCOPE_HOLD
+    local signature=state.applied..":"..id
+    local hold=state.hold
+    if hold and hold.animator==animator and hold.signature==signature and hold.track.IsPlaying then
+        suppressToolHold(tool,hold)
+        return
+    end
+    local pending=state.holdPending
+    if pending and pending.animator==animator and pending.signature==signature then return end
+    if state.holdRetry and state.holdRetry.signature==signature and state.holdRetry.untilTime>os.clock() then return end
+    stopScopeHold(state)
+    local generation=state.holdGeneration
+    local model=state.model
+    pending={animator=animator,signature=signature}
+    state.holdPending=pending
+    local function current()
+        return alive and runtimeAlive and toolStates[tool]==state and state.holdGeneration==generation
+            and state.holdPending==pending and state.model==model and tool.Parent==character
+            and player.Character==character and humanoid.Health>0
+            and humanoid:FindFirstChildOfClass("Animator")==animator
+    end
+    task.spawn(function()
+        local track=nil
+        local animation=nil
+        local ownsTrack=false
+        -- Reuse the game's original hold if it is already playing. Disabling
+        -- the cosmetic must never stop a track owned by the gun's own scripts.
+        for _,candidate in ipairs(playingTracks(animator)) do
+            if candidate.IsPlaying and candidate.Animation and assetId(candidate.Animation.AnimationId)==id then
+                track=candidate; break
+            end
+        end
+        if not track then
+            ownsTrack=true
+            animation=Instance.new("Animation")
+            animation.Name="VisualsV2ScopeHold"
+            animation:SetAttribute(MARKER,true)
+            animation.AnimationId="rbxassetid://"..id
+            animation.Parent=model
+            local ok,result=pcall(function() return animator:LoadAnimation(animation) end)
+            if ok then track=result end
+            local deadline=os.clock()+6
+            while track and current() and track.Length<=0 and os.clock()<deadline do task.wait(0.1) end
+        end
+        local function discard()
+            if ownsTrack and track then
+                pcall(function() track:Stop(0) end)
+                pcall(function() track:Destroy() end)
+            end
+            if animation then animation:Destroy() end
+        end
+        if not current() then discard(); return end
+        local ok=track and (not ownsTrack or track.Length>0)
+        if ok and ownsTrack then
+            ok=pcall(function()
+                track.Priority=Enum.AnimationPriority.Action
+                track.Looped=true
+                track:Play(0.12,1,1)
+            end)
+        end
+        if not ok then
+            discard()
+            state.holdPending=nil
+            state.holdRetry={signature=signature,untilTime=os.clock()+30}
+            local warning=rig..":"..id
+            if not scopeHoldWarnings[warning] then
+                scopeHoldWarnings[warning]=true
+                notify("The original scope hold could not load in this game ("..id.."); the scope skin is still enabled.")
+            end
+            return
+        end
+        state.holdPending=nil
+        state.holdRetry=nil
+        hold={track=track,animation=animation,animator=animator,signature=signature,
+            owned=ownsTrack,suppressed={}}
+        state.hold=hold
+        model:SetAttribute("ScopeHoldAnimationID",id)
+        hold.died=humanoid.Died:Connect(function()
+            if state.hold==hold then stopScopeHold(state) end
+        end)
+        suppressToolHold(tool,hold)
+    end)
+end
+
+local function restoreVisuals(state)
+    stopScopeHold(state)
+    state.holdRetry=nil
+    state.scopeTemplateHold=nil
+    if state.model then state.model:Destroy(); state.model=nil end
+    for object,record in pairs(state.originals) do
+        pcall(function() object[record.property]=record.value end)
+    end
+    table.clear(state.originals)
+    state.applied=nil
+    state.handle=nil
+    state.appliedGrip=nil
+end
+
+local function hideOriginals(tool,state)
+    for _,object in ipairs(tool:GetDescendants()) do
+        if not owned(object,tool) then
+            local property,value=nil,nil
+            if object:IsA("BasePart") then property,value="LocalTransparencyModifier",1
+            elseif object:IsA("Decal") then property,value="Transparency",1
+            elseif object:IsA("ParticleEmitter") or object:IsA("Trail") or object:IsA("Beam")
+                or object:IsA("Fire") or object:IsA("Smoke") or object:IsA("Sparkles")
+                or object:IsA("Light") then property,value="Enabled",false end
+            if property then
+                if not state.originals[object] then state.originals[object]={property=property,value=object[property]} end
+                pcall(function() object[property]=value end)
+            end
+        end
+    end
+end
+
+local function localTool(tool)
+    return tool.Parent==player.Character or tool.Parent==player:FindFirstChildOfClass("Backpack")
+end
+
+local function actualKind(tool)
+    return weaponKind(tool.Name) or weaponKind(tool:GetAttribute("WeaponType") or tool:GetAttribute("ItemType"))
+end
+
+local function apply(tool,state)
+    local kind=actualKind(tool)
+    local settings=kind and kinds[kind]
+    local entry=settings and catalog[kind][settings.selected]
+    if not settings or not settings.enabled or not entry or not localTool(tool) then
+        if state.model or state.hold or state.holdPending then restoreVisuals(state) end
+        return
+    end
+    local handle=tool:FindFirstChild("Handle") or visualRoot(tool)
+    if not handle or not handle:IsA("BasePart") then restoreVisuals(state); return end
+    local signature=cacheKey(entry)..":"..entry.revision
+    if state.applied==signature and state.handle==handle and state.appliedGrip==tool.Grip
+        and state.model and state.model.Parent==tool then
+        updateScopeHold(tool,state,entry)
+        return
+    end
+    local template=templateFor(entry)
+    if not template then
+        -- Never leave the previous selection or an invisible Handle behind.
+        if state.model then restoreVisuals(state) end
+        return
+    end
+    local model=cloneObject(template.model)
+    if not model then return end
+    local root=model.PrimaryPart or visualRoot(model)
+    if not root then model:Destroy(); return end
+    local origin=root.CFrame
+    local offset=template.grip and tool.Grip*template.grip:Inverse() or CFrame.new()
+    local partCount=0
+    for _,part in ipairs(model:GetDescendants()) do
+        if part:IsA("BasePart") then
+            local relative=offset*origin:ToObjectSpace(part.CFrame)
+            part.Anchored=false; part.CanCollide=false; part.CanTouch=false; part.CanQuery=false
+            part.Massless=true; part.CastShadow=false; part.LocalTransparencyModifier=0
+            part.CFrame=handle.CFrame*relative
+            local weld=Instance.new("Weld")
+            weld.Name="VisualsV2_ClientSkinWeld"
+            weld.Part0=handle; weld.Part1=part; weld.C0=relative; weld.C1=CFrame.new()
+            weld.Parent=part
+            partCount=partCount+1
+        end
+    end
+    if partCount==0 then model:Destroy(); return end
+    restoreVisuals(state)
+    model.Name="VisualsV2_Client"..kind.."Skin"
+    model:SetAttribute("WeaponID",entry.id)
+    state.model=model; state.handle=handle; state.applied=signature
+    state.appliedGrip=tool.Grip
+    state.scopeTemplateHold=template.scopeHold
+    model.Parent=tool
+    hideOriginals(tool,state)
+    updateScopeHold(tool,state,entry)
+end
+
+local function forgetTool(tool)
+    local state=toolStates[tool]
+    if not state then return end
+    toolStates[tool]=nil
+    for _,connection in ipairs(state.connections) do connection:Disconnect() end
+    restoreVisuals(state)
+end
+
+local function trackTool(tool)
+    if not tool:IsA("Tool") or not actualKind(tool) then return end
+    local state=toolStates[tool]
+    if not state then
+        state={originals={},connections={},queued=false}
+        toolStates[tool]=state
+        local function changed(object)
+            if object and owned(object,tool) then return end
+            if state.queued then return end
+            state.queued=true
+            task.defer(function()
+                state.queued=false
+                if alive and runtimeAlive and toolStates[tool]==state then
+                    if localTool(tool) then
+                        if state.model then hideOriginals(tool,state) end
+                        apply(tool,state)
+                    else forgetTool(tool) end
+                end
+            end)
+        end
+        state.connections[1]=tool.DescendantAdded:Connect(changed)
+        state.connections[2]=tool.DescendantRemoving:Connect(changed)
+        state.connections[3]=tool.AncestryChanged:Connect(function() changed() end)
+    end
+    apply(tool,state)
+end
+
+refreshTools=function()
+    if not alive or not runtimeAlive then return end
+    for tool,state in pairs(toolStates) do
+        if localTool(tool) then apply(tool,state) else forgetTool(tool) end
+    end
+    if not kinds.Gun.enabled and not kinds.Knife.enabled then return end
+    local function scan(container)
+        if container then for _,tool in ipairs(container:GetChildren()) do trackTool(tool) end end
+    end
+    scan(player.Character)
+    scan(player:FindFirstChildOfClass("Backpack"))
+end
+
+updateWatching=function()
+    if heartbeat then heartbeat:Disconnect(); heartbeat=nil end
+    if hideFrame then hideFrame:Disconnect(); hideFrame=nil end
+    refreshTools()
+    if not alive or not runtimeAlive or (not kinds.Gun.enabled and not kinds.Knife.enabled) then
+        for tool in pairs(toolStates) do forgetTool(tool) end
+        return
+    end
+    local elapsed=0
+    heartbeat=RunService.Heartbeat:Connect(function(dt)
+        elapsed=elapsed+math.max(tonumber(dt) or 0,0)
+        if elapsed>=0.25 then elapsed=0; refreshTools() end
+    end)
+    hideFrame=RunService.RenderStepped:Connect(function()
+        -- Roblox's first-person transparency controller can change the original
+        -- Handle every frame. Enforce only the saved originals, never the skin.
+        for tool,state in pairs(toolStates) do
+            if state.model and tool.Parent==player.Character then
+                for object,record in pairs(state.originals) do
+                    pcall(function()
+                        if record.property=="Enabled" then object.Enabled=false else object[record.property]=1 end
+                    end)
+                end
+            end
+        end
+    end)
+end
+
+section:AddParagraph("Client Weapon Skins","Choose a gun and knife independently. The lists include every weapon supplied by this game's database, including trophies, except the defaults. Original Voidscope, Matrixscope and all five Gingerscope variants are also available in MM2 and MMV. Scope variants use the original two-hand hold while equipped. Skins are visible to you and return to your equipped skins when disabled.")
+for _,kind in ipairs({"Gun","Knife"}) do
+    local state=kinds[kind]
+    state.labels={}
+    state.dropdown=addDropdown(section,kind.." Skin",{NONE},nil,function(value)
+        if refreshing then return end
+        if type(value)=="table" then value=value[1] end
+        local id=value==NONE and NONE or state.labels[value]
+        if not id then return end
+        state.selected=id
+        SetCfg(state.key.."Skin",id)
+        refreshTools()
+    end)
+    state.toggle=addToggle(section,"Enable Custom Client "..kind,state.enabled,function(value)
+        state.enabled=value
+        SetCfg(state.key.."Enabled",value)
+        if value then requestCatalog(false,false) end
+        updateWatching()
+    end)
+end
+section:AddButton("Refresh All Weapon Skins",function()
+    table.clear(failed)
+    table.clear(warned)
+    table.clear(scopeHoldWarnings)
+    for _,state in pairs(toolStates) do state.holdRetry=nil end
+    syncRetry=0
+    requestCatalog(true,true)
+end)
+
+connections[#connections+1]=RS.DescendantAdded:Connect(function(object)
+    if not (object:IsA("ModuleScript") or object:IsA("Model") or object:IsA("Tool")
+        or object:IsA("BasePart") or object.Name=="GetSyncData") then return end
+    if catalogQueued then return end
+    catalogQueued=true
+    task.delay(1,function()
+        catalogQueued=false
+        if alive and runtimeAlive then requestCatalog(false,false) end
+    end)
+end)
+connections[#connections+1]=player.CharacterAdded:Connect(function()
+    task.defer(function() if alive and runtimeAlive then refreshTools() end end)
+end)
+connections[#connections+1]=player.ChildAdded:Connect(function(child)
+    if child:IsA("Backpack") then task.defer(function() if alive and runtimeAlive then refreshTools() end end) end
+end)
+env.VisualsV2Runtime.ClientWeaponSkins={
+    Catalog=catalog,
+    Refresh=function() requestCatalog(true,true) end,
+    GetCounts=function()
+        local counts={Gun=0,Knife=0}
+        for kind,entries in pairs(catalog) do for _ in pairs(entries) do counts[kind]=counts[kind]+1 end end
+        return counts
+    end,
+}
+env.VisualsV2Runtime.RegisterReset(function()
+    for _,state in pairs(kinds) do
+        state.enabled=false; state.selected=NONE
+        state.toggle:Set(false)
+    end
+    updateWatching()
+    refreshing=true
+    for _,state in pairs(kinds) do setDropdown(state.dropdown,"Select",NONE) end
+    refreshing=false
+    if not runtimeAlive then
+        alive=false
+        scanGeneration=scanGeneration+1
+        for _,connection in ipairs(connections) do connection:Disconnect() end
+        for _,template in pairs(cache) do template.model:Destroy() end
+        table.clear(cache)
+        table.clear(moduleData)
+        table.clear(nativeScopeHolds)
+    end
+end)
+requestCatalog(false,false)
+updateWatching()
+for _,delay in ipairs({2,8,25}) do
+    task.delay(delay,function() if alive and runtimeAlive then requestCatalog(false,false) end end)
+end
+end)()
+
+
+-- =========================================================
+-- UTILITIES: SHIFT LOCK + CENTRE AIM FOR THROWABLES (MM2 / MMV)
+-- The game's Tool still handles activation, cooldowns and projectile creation.
+-- Only the aim input is changed, while a throwable is equipped AND locked.
+-- =========================================================
+;(function()
+local section=mainTab:AddSection("Shift Lock & Throwables","Utilities")
+local GuiService=game:GetService("GuiService")
+local CAS=game:GetService("ContextActionService")
+local mouse=player:GetMouse()
+local alive=true
+local mode=C("vv2CustomShiftLock",false)
+local locked=C("vv2CustomShiftLocked",true)
+local aimEnabled=C("vv2ThrowableCentreAim",false)
+local frameBound=false
+local ownState=nil
+local gui,reticle,lockButton=nil,nil,nil
+local activeAim=nil
+local nativeCameras=nil
+local modeToggle,aimToggle
+local ACTION="VisualsV2_ShiftLockAction"
+local FRAME="VisualsV2_ShiftLockFrame"
+local castParams=RaycastParams.new()
+castParams.FilterType=Enum.RaycastFilterType.Exclude
+castParams.IgnoreWater=true
+local checkCaller=checkcaller or env.checkcaller
+local callingScript=getcallingscript or env.getcallingscript
+local namecallMethod=getnamecallmethod or env.getnamecallmethod
+local hookMeta=hookmetamethod or env.hookmetamethod
+local makeClosure=newcclosure or env.newcclosure
+local refresh
+
+local function notify(message)
+    if alive and runtimeAlive then pcall(function() shared.Notify(message,4) end) end
+end
+
+local function compact(value) return type(value)=="string" and value:lower():gsub("[^%w]","") or "" end
+
+local function throwable(tool)
+    if not tool or not tool:IsA("Tool") then return false end
+    local name=compact(tool.Name)
+    if name=="knife" or name=="gun" then return false end
+    return tool:GetAttribute("Throwable")==true or tool:GetAttribute("IsThrowable")==true
+        or name:find("bomb",1,true)~=nil or name:find("grenade",1,true)~=nil
+        or name:find("snowball",1,true)~=nil or name:find("dynamite",1,true)~=nil
+        or name:find("throwable",1,true)~=nil or name=="fakec4" or name=="c4"
+end
+
+local function equippedThrowable(character)
+    if character then
+        for _,tool in ipairs(character:GetChildren()) do if throwable(tool) then return tool end end
+    end
+end
+
+local function nativeLocked(ignoreCursor)
+    if nativeCameras then
+        for _,key in ipairs({"activeMouseLockController","activeCameraController"}) do
+            local controller=nativeCameras[key]
+            if type(controller)=="table" and type(controller.GetIsMouseLocked)=="function" then
+                local ok,value=pcall(controller.GetIsMouseLocked,controller)
+                if ok and value==true then return true end
+            end
+        end
+    end
+    for _,object in ipairs({player,player.Character}) do
+        if object then
+            for _,key in ipairs({"ShiftLocked","ShiftLock","IsShiftLocked","MouseLocked"}) do
+                if object:GetAttribute(key)==true then return true end
+                local flag=object:FindFirstChild(key)
+                if flag and flag:IsA("BoolValue") and flag.Value then return true end
+            end
+        end
+    end
+    -- Mouse locking on touch devices may be represented only by the native
+    -- controller/attributes. Our own cursor write must not impersonate it.
+    return not ignoreCursor and not ownState and UserInputService.MouseBehavior==Enum.MouseBehavior.LockCenter
+end
+
+local function allowedCamera(character,humanoid,cam)
+    if not character or not humanoid or humanoid.Health<=0 or not cam
+        or cam.CameraType==Enum.CameraType.Scriptable or UserInputService:GetFocusedTextBox()
+        or GuiService.MenuIsOpen then return false end
+    local subject=cam.CameraSubject
+    return subject==humanoid or (subject and subject:IsDescendantOf(character)) or false
+end
+
+local function restoreOwnLock()
+    if not ownState then return end
+    local state=ownState
+    ownState=nil
+    pcall(function()
+        if state.humanoid.CameraOffset==state.offsetWritten then state.humanoid.CameraOffset=state.cameraOffset end
+        if state.humanoid.AutoRotate==false then state.humanoid.AutoRotate=state.autoRotate end
+    end)
+    pcall(function()
+        if UserInputService.MouseBehavior==Enum.MouseBehavior.LockCenter and not nativeLocked(true) then
+            UserInputService.MouseBehavior=state.mouseBehavior
+        end
+    end)
+end
+
+local function applyOwnLock(humanoid,root,cam)
+    if ownState and ownState.humanoid~=humanoid then restoreOwnLock() end
+    if not ownState then
+        ownState={humanoid=humanoid,cameraOffset=humanoid.CameraOffset,autoRotate=humanoid.AutoRotate,
+            mouseBehavior=UserInputService.MouseBehavior}
+        ownState.offsetWritten=ownState.cameraOffset+Vector3.new(1.75,0,0)
+    end
+    humanoid.AutoRotate=false
+    local firstPerson=(cam.CFrame.Position-cam.Focus.Position).Magnitude<1
+    ownState.offsetWritten=firstPerson and ownState.cameraOffset or ownState.cameraOffset+Vector3.new(1.75,0,0)
+    humanoid.CameraOffset=ownState.offsetWritten
+    if not UserInputService.TouchEnabled then UserInputService.MouseBehavior=Enum.MouseBehavior.LockCenter end
+    if root and not humanoid.Sit then
+        local forward=cam.CFrame.LookVector
+        local flat=Vector3.new(forward.X,0,forward.Z)
+        if flat.Magnitude>0.001 then root.CFrame=CFrame.lookAt(root.Position,root.Position+flat) end
+    end
+end
+
+local function createGui()
+    if gui and gui.Parent then return end
+    local parent=player:FindFirstChildOfClass("PlayerGui")
+    if not parent then return end
+    gui=Instance.new("ScreenGui")
+    gui.Name="VisualsV2_ShiftLock"
+    gui.ResetOnSpawn=false
+    gui.IgnoreGuiInset=true
+    gui.DisplayOrder=90
+    local dot=Instance.new("Frame")
+    dot.Name="AimReticle"
+    dot.AnchorPoint=Vector2.new(0.5,0.5)
+    dot.Position=UDim2.fromScale(0.5,0.5)
+    dot.Size=UDim2.fromOffset(5,5)
+    dot.BackgroundColor3=Color3.new(1,1,1)
+    dot.BorderSizePixel=0
+    dot.Visible=false
+    dot.Parent=gui
+    local corner=Instance.new("UICorner")
+    corner.CornerRadius=UDim.new(1,0)
+    corner.Parent=dot
+    local stroke=Instance.new("UIStroke")
+    stroke.Color=Color3.new(0,0,0)
+    stroke.Thickness=1
+    stroke.Parent=dot
+    local button=Instance.new("TextButton")
+    button.Name="ShiftLockButton"
+    button.AnchorPoint=Vector2.new(1,0.5)
+    button.Position=UDim2.new(1,-22,0.55,0)
+    button.Size=UDim2.fromOffset(62,44)
+    button.BackgroundColor3=Color3.fromRGB(38,38,38)
+    button.BackgroundTransparency=0.15
+    button.BorderSizePixel=0
+    button.TextColor3=Color3.new(1,1,1)
+    button.TextSize=10
+    button.Font=Enum.Font.GothamBold
+    button.Visible=false
+    button.Parent=gui
+    corner=Instance.new("UICorner")
+    corner.CornerRadius=UDim.new(0,12)
+    corner.Parent=button
+    button.Activated:Connect(function()
+        if not alive or not runtimeAlive or not mode then return end
+        locked=not locked
+        SetCfg("vv2CustomShiftLocked",locked)
+        activeAim=nil
+    end)
+    gui.Parent=parent
+    reticle,lockButton=dot,button
+end
+
+local function destroyGui()
+    if gui then gui:Destroy() end
+    gui,reticle,lockButton=nil,nil,nil
+end
+
+local function centreAim(cam,character,tool)
+    local size=cam.ViewportSize
+    if size.X<=0 or size.Y<=0 then return nil end
+    local ray=cam:ViewportPointToRay(size.X/2,size.Y/2,0)
+    local ignore={character,cam}
+    local targetFilter=mouse.TargetFilter
+    if targetFilter then ignore[#ignore+1]=targetFilter end
+    castParams.FilterDescendantsInstances=ignore
+    local result=workspace:Raycast(ray.Origin,ray.Direction*1000,castParams)
+    local position=result and result.Position or ray.Origin+ray.Direction*1000
+    local handle=tool:FindFirstChild("Handle")
+    local root=character:FindFirstChild("HumanoidRootPart")
+    local origin=(handle and handle:IsA("BasePart") and handle.Position) or (root and root.Position) or ray.Origin
+    local towards=position-origin
+    return {tool=tool,camera=cam,ray=ray,position=position,
+        hit=CFrame.new(position)*cam.CFrame.Rotation,target=result and result.Instance or nil,
+        origin=origin,direction=towards.Magnitude>0.001 and towards.Unit or ray.Direction,
+        x=size.X/2,y=size.Y/2}
+end
+
+local function frame()
+    if not alive or not runtimeAlive then return end
+    activeAim=nil
+    local character=player.Character
+    local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+    local root=character and character:FindFirstChild("HumanoidRootPart")
+    local cam=workspace.CurrentCamera
+    local permitted=allowedCamera(character,humanoid,cam)
+    local native=nativeLocked()
+    if permitted and mode and locked and not native then applyOwnLock(humanoid,root,cam)
+    else restoreOwnLock() end
+    local effective=permitted and ((mode and locked) or native)
+    local tool=equippedThrowable(character)
+    if effective and aimEnabled and tool then activeAim=centreAim(cam,character,tool) end
+    createGui()
+    if reticle then reticle.Visible=effective and (mode or activeAim~=nil) end
+    if lockButton then
+        lockButton.Visible=mode and UserInputService.TouchEnabled
+        lockButton.Text=locked and "LOCKED" or "UNLOCKED"
+        lockButton.BackgroundColor3=locked and Color3.fromRGB(60,95,140) or Color3.fromRGB(38,38,38)
+    end
+end
+
+local function gameCaller(aim)
+    if not alive or not runtimeAlive or not aimEnabled or not aim then return false end
+    if type(checkCaller)=="function" then
+        local ok,result=pcall(checkCaller)
+        if not ok or result then return false end
+    end
+    if type(callingScript)=="function" then
+        local ok,source=pcall(callingScript)
+        if not ok then return false end
+        if source then
+            if source:IsDescendantOf(aim.tool) then return true end
+            local ancestor=source.Parent
+            while ancestor and ancestor~=game do
+                if ancestor:IsA("Tool") then return false end
+                ancestor=ancestor.Parent
+            end
+            local name=compact(source.Name)
+            return name:find("bomb",1,true)~=nil or name:find("throw",1,true)~=nil
+                or name:find("toy",1,true)~=nil or name:find("projectile",1,true)~=nil
+        end
+    end
+    return type(checkCaller)=="function"
+end
+
+local function targetValue(value,aim,direction)
+    local valueType=typeof(value)
+    if valueType=="Vector3" then return direction and aim.direction*value.Magnitude or aim.position end
+    if valueType=="CFrame" then return aim.hit end
+    if valueType=="Ray" then return Ray.new(value.Origin,aim.direction*value.Direction.Magnitude) end
+    return value
+end
+
+local function rewritePayload(payload,aim)
+    if type(payload)~="table" then return nil end
+    local result=nil
+    local positions={position=true,targetposition=true,mouseposition=true,mouselocation=true,
+        mousehit=true,hit=true,target=true}
+    for key,value in pairs(payload) do
+        local name=compact(key)
+        local valueType=typeof(value)
+        if (positions[name] or name=="direction" or name=="throwdirection")
+            and (valueType=="Vector3" or valueType=="CFrame" or valueType=="Ray") then
+            if not result then result=table.clone(payload) end
+            result[key]=targetValue(value,aim,name=="direction" or name=="throwdirection")
+        end
+    end
+    return result
+end
+
+local function rewriteArguments(remote,args,aim)
+    local toolLocal=remote:IsDescendantOf(aim.tool)
+    local name=compact(remote.Name)
+    local command=type(args[1])=="string" and compact(args[1]) or ""
+    local function aimOperation(value)
+        return value:find("throw",1,true)~=nil or value:find("toss",1,true)~=nil
+            or value:find("launch",1,true)~=nil or value:find("mousepos",1,true)~=nil
+            or value:find("mouseloc",1,true)~=nil or value=="aim" or value=="settarget"
+            or value=="plantbomb"
+    end
+    local operation=aimOperation(name) or aimOperation(command)
+    if not toolLocal and not operation then return nil end
+    if not toolLocal and type(callingScript)=="function" then
+        local ok,source=pcall(callingScript)
+        if not ok or not source or not source:IsDescendantOf(aim.tool) then return nil end
+    elseif not toolLocal then return nil end
+    -- Generic gear remotes must carry a throw/aim command or an unambiguous
+    -- target payload. Explode, equip, purchase and cooldown messages pass through.
+    if not operation and command~="" then return nil end
+    if not operation and name~="remoteevent" and name~="remotefunction"
+        and name~="remote" and name~="clientcontrol" and name~="servercontrol" then return nil end
+    local output=nil
+    local candidates={}
+    for index=1,args.n do
+        local value=args[index]
+        local valueType=typeof(value)
+        if valueType=="table" then
+            local payload=rewritePayload(value,aim)
+            if payload then
+                output=output or table.clone(args)
+                output[index]=payload
+            end
+        elseif valueType=="Vector3" or valueType=="CFrame" or valueType=="Ray" then
+            candidates[#candidates+1]=index
+        end
+    end
+    if #candidates==1 then
+        local index=candidates[1]
+        output=output or table.clone(args)
+        output[index]=targetValue(args[index],aim,name:find("direction",1,true)~=nil or command:find("direction",1,true)~=nil)
+    elseif #candidates==2 and operation then
+        -- Known origin + target/direction layouts: preserve the launch origin.
+        -- Ambiguous multi-vector layouts are left to the Mouse/ray input path.
+        local first,second=args[candidates[1]],args[candidates[2]]
+        local origin=typeof(first)=="Vector3" and first or (typeof(first)=="CFrame" and first.Position)
+        if origin and (origin-aim.origin).Magnitude<=8 then
+            output=output or table.clone(args)
+            local isDirection=typeof(second)=="Vector3" and second.Magnitude<=1.01
+            output[candidates[2]]=targetValue(second,aim,isDirection)
+        end
+    end
+    return output
+end
+
+-- One persistent bridge is reused across add-on executions. Wrappers are
+-- installed once and become pass-through when their current owner is reset.
+-- This preserves other add-ons' hooks and avoids an ever-growing hook chain.
+local bridge=env.VisualsV2ThrowableAimBridge
+if type(bridge)~="table" or bridge.version~=1 then
+    bridge={version=1}
+    env.VisualsV2ThrowableAimBridge=bridge
+end
+local handler={}
+handler.Index=function(object,key)
+    local aim=activeAim
+    if object~=mouse or not gameCaller(aim) or type(key)~="string" then return false end
+    local name=key:lower()
+    if name=="hit" then return true,aim.hit end
+    if name=="target" then return true,aim.target end
+    if name=="unitray" then return true,aim.ray end
+    if name=="origin" then return true,CFrame.lookAt(aim.ray.Origin,aim.ray.Origin+aim.ray.Direction) end
+    if name=="x" then return true,aim.x end
+    if name=="y" then return true,aim.y end
+    return false
+end
+handler.Namecall=function(object,method,args)
+    local aim=activeAim
+    if not gameCaller(aim) then return nil end
+    if object==aim.camera and (method=="ScreenPointToRay" or method=="ViewportPointToRay") then
+        local depth=tonumber(args[3]) or 0
+        return "value",Ray.new(aim.ray.Origin+aim.ray.Direction*depth,aim.ray.Direction)
+    end
+    if object==UserInputService and method=="GetMouseLocation" then return "value",Vector2.new(aim.x,aim.y) end
+    if (method=="FireServer" and object:IsA("RemoteEvent"))
+        or (method=="InvokeServer" and object:IsA("RemoteFunction")) then
+        local rewritten=rewriteArguments(object,args,aim)
+        if rewritten then return "args",rewritten end
+    end
+end
+bridge.handler=handler
+
+local function installHooks()
+    if bridge.indexReady and bridge.namecallReady then return true end
+    if type(namecallMethod)~="function" or (type(checkCaller)~="function" and type(callingScript)~="function") then return false end
+    local hook=hookMeta
+    if type(hook)~="function" then
+        local rawMeta=getrawmetatable or env.getrawmetatable
+        local readOnly=setreadonly or env.setreadonly
+        local isReadOnly=isreadonly or env.isreadonly
+        if type(rawMeta)~="function" or type(readOnly)~="function" then return false end
+        hook=function(object,key,replacement)
+            local mt=rawMeta(object)
+            local old=mt[key]
+            local previous=true
+            if type(isReadOnly)=="function" then previous=isReadOnly(mt) end
+            readOnly(mt,false)
+            mt[key]=replacement
+            readOnly(mt,previous)
+            return old
+        end
+    end
+    if not bridge.indexReady then
+        local previous
+        local wrapper=function(object,key)
+            local current=bridge.handler
+            if current and not bridge.dispatching then
+                bridge.dispatching=true
+                local ok,handled,value=pcall(current.Index,object,key)
+                bridge.dispatching=false
+                if ok and handled then return value end
+            end
+            return previous(object,key)
+        end
+        if type(makeClosure)=="function" then wrapper=makeClosure(wrapper) end
+        local ok,original=pcall(hook,game,"__index",wrapper)
+        if not ok or type(original)~="function" then return false end
+        previous=original
+        bridge.indexReady=true
+    end
+    if not bridge.namecallReady then
+        local previous
+        local wrapper=function(object,...)
+            local method=namecallMethod()
+            local current=bridge.handler
+            if current and not bridge.dispatching then
+                bridge.dispatching=true
+                local ok,action,value=pcall(current.Namecall,object,method,table.pack(...))
+                bridge.dispatching=false
+                if ok and action=="value" then return value end
+                if ok and action=="args" then return previous(object,table.unpack(value,1,value.n)) end
+            end
+            return previous(object,...)
+        end
+        if type(makeClosure)=="function" then wrapper=makeClosure(wrapper) end
+        local ok,original=pcall(hook,game,"__namecall",wrapper)
+        if not ok or type(original)~="function" then return false end
+        previous=original
+        bridge.namecallReady=true
+    end
+    return true
+end
+
+local function keyAction(_,state)
+    if not alive or not runtimeAlive or not mode then return Enum.ContextActionResult.Pass end
+    if UserInputService:GetFocusedTextBox() or GuiService.MenuIsOpen then return Enum.ContextActionResult.Pass end
+    if state==Enum.UserInputState.Begin then
+        locked=not locked
+        SetCfg("vv2CustomShiftLocked",locked)
+        activeAim=nil
+    end
+    return Enum.ContextActionResult.Sink
+end
+
+refresh=function()
+    activeAim=nil
+    CAS:UnbindAction(ACTION)
+    if mode and alive and runtimeAlive then
+        CAS:BindActionAtPriority(ACTION,keyAction,false,Enum.ContextActionPriority.High.Value+1,
+            Enum.KeyCode.LeftShift,Enum.KeyCode.RightShift)
+    end
+    if not alive or not runtimeAlive or (not mode and not aimEnabled) then
+        if frameBound then RunService:UnbindFromRenderStep(FRAME); frameBound=false end
+        restoreOwnLock()
+        destroyGui()
+        return
+    end
+    if not frameBound then
+        RunService:BindToRenderStep(FRAME,Enum.RenderPriority.Camera.Value+1,function()
+            local ok=pcall(frame)
+            if not ok then activeAim=nil; restoreOwnLock() end
+        end)
+        frameBound=true
+    end
+end
+
+section:AddParagraph("Shift Lock Aiming","Enable Custom Shift Lock, then press Shift or use the mobile lock button. Centre Aim for Throwables makes Fake Bomb, Gold Bomb and other throwable tools aim at the centre dot while locked. It also follows detected game shift lock.")
+modeToggle=addToggle(section,"Enable Custom Shift Lock",mode,function(value)
+    local wasEnabled=mode
+    mode=value
+    if value and not wasEnabled then locked=true; SetCfg("vv2CustomShiftLocked",locked) end
+    SetCfg("vv2CustomShiftLock",value)
+    refresh()
+end)
+aimToggle=addToggle(section,"Centre Aim for Throwables",aimEnabled,function(value)
+    if value and not installHooks() then
+        aimEnabled=false
+        SetCfg("vv2ThrowableCentreAim",false)
+        task.defer(function() if aimToggle then aimToggle:Set(false) end end)
+        notify("Throwable centre aim is unavailable in this executor. Custom shift lock still works.")
+    else aimEnabled=value; SetCfg("vv2ThrowableCentreAim",value) end
+    refresh()
+end)
+
+env.VisualsV2Runtime.ShiftLockThrowables={
+    IsLocked=function() return (mode and locked) or nativeLocked() end,
+    GetAim=function() return activeAim end,
+}
+env.VisualsV2Runtime.RegisterReset(function()
+    mode=false; locked=false; aimEnabled=false; activeAim=nil
+    modeToggle:Set(false); aimToggle:Set(false)
+    refresh()
+    if not runtimeAlive then
+        alive=false
+        if bridge.handler==handler then bridge.handler=nil end
+    end
+end)
+task.spawn(function()
+    -- Reuse the standard camera controller when present; do not change its
+    -- permissions, input bindings or cached game shift-lock state.
+    local scripts=player:FindFirstChild("PlayerScripts")
+    local module=scripts and scripts:FindFirstChild("PlayerModule")
+    if module and module:IsA("ModuleScript") then
+        local ok,result=pcall(require,module)
+        if ok and type(result)=="table" and type(result.GetCameras)=="function" then
+            local cameraOk,cameras=pcall(result.GetCameras,result)
+            if cameraOk and type(cameras)=="table" and alive and runtimeAlive then nativeCameras=cameras end
+        end
+    end
+end)
+if aimEnabled and not installHooks() then aimEnabled=false; SetCfg("vv2ThrowableCentreAim",false) end
+refresh()
+end)()
+
 
 ;(function()
 local section=mainTab:AddSection("Custom Knife/Gun","Visuals")
